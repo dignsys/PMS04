@@ -48,10 +48,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 // Using I2C Expander (MAX14830)
 #define PZEM004_I2C_SERIAL
 #if defined(PZEM004_I2C_SERIAL)
-#ifdef USE_SC16IS752
 #include "SC16IS752Serial.h"
-#endif
-#include "MAX14830Serial.h"
 #endif
 
 #ifndef PZEM004_NO_SWSERIAL
@@ -87,10 +84,7 @@ public:
 
 #if defined(ESP32)
   #if defined(PZEM004_I2C_SERIAL)
-    #ifdef USE_SC16IS752
     PZEM004Tv30(SC16IS752Serial& port);
-    #endif
-    PZEM004Tv30(MAX14830Serial& port);
   #else
     /* ESP32 Hardware serial interface requires the receive and transmit pin specified */
     PZEM004Tv30(HardwareSerial& port, uint8_t receivePin, uint8_t transmitPin, uint8_t addr=PZEM_DEFAULT_ADDR);
@@ -133,20 +127,13 @@ public:
     void search();
 
     #if defined(PZEM004_I2C_SERIAL)
-    #ifdef USE_SC16IS752
     void init(SC16IS752Serial* port, bool isSoft, uint8_t addr); // Init common to all constructors
-    #endif
-    void init(MAX14830Serial* port, bool isSoft, uint8_t addr); // Init common to all constructors
     #endif
 
 private:
 
     #ifdef PZEM004_I2C_SERIAL
-    #ifdef USE_SC16IS752
     SC16IS752Serial* _serial;
-    #else
-    MAX14830Serial* _serial;
-    #endif
     #else
     Stream* _serial; // Serial interface
     #endif

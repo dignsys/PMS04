@@ -4,7 +4,6 @@
  */
 
 #include <Arduino.h>
-#include <MAX14830Serial.h>
 #include <SC16IS752Serial.h>
 #include <PZEM004Tv30.h>
 #include <SoftWire.h>
@@ -12,32 +11,29 @@
 #include <SPI.h>
 #include <Ethernet_Generic.h>
 
+#define DISABLE_IR_FUNCTION
+
+#ifndef DISABLE_IR_FUNCTION
 #define DECODE_NEC
 //#define DECODE_DENON
 #define DISABLE_CODE_FOR_RECEIVER // Disables restarting receiver after each send. Saves 450 bytes program memory and 269 bytes RAM if receiving functions are not used.
 //#define SEND_PWM_BY_TIMER         // Disable carrier PWM generation in software and use (restricted) hardware PWM.
 //#define USE_NO_SEND_PWM           // Use no carrier PWM, just simulate an active low receiver signal. Overrides SEND_PWM_BY_TIMER definition
 #include <IRremote.hpp>
+#endif
 
-#ifdef USE_SC16IS752
 SC16IS752Serial serial0 = SC16IS752Serial(0);
 SC16IS752Serial serial1 = SC16IS752Serial(1);
 SC16IS752Serial serial2 = SC16IS752Serial(2);
 SC16IS752Serial serial3 = SC16IS752Serial(3);
-#else
-MAX14830Serial serial0 = MAX14830Serial(0);
-MAX14830Serial serial1 = MAX14830Serial(1);
-MAX14830Serial serial2 = MAX14830Serial(2);
-MAX14830Serial serial3 = MAX14830Serial(3);
-#endif
 
 PZEM004Tv30 pzem0(serial0);
 PZEM004Tv30 pzem1(serial1);
 PZEM004Tv30 pzem2(serial2);
 PZEM004Tv30 pzem3(serial3);
 
-uint8_t rx_buf[MAX_RX_BUF_SIZE];
-uint8_t tx_buf[MAX_TX_BUF_SIZE];
+uint8_t rx_buf[SC_RX_BUF_SIZE];
+uint8_t tx_buf[SC_TX_BUF_SIZE];
 
 #define PZEM004_SUB_TEST
 
@@ -203,17 +199,13 @@ void setup() {
   digitalWrite(PIN_MAX485_DE, MAX485_DIR_SEND);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
-#ifdef USE_SC16IS752
-  Wire.setClock(400000);  // 400kHz
-#else
-  Wire.setClock(1000000);  // 1MHz, 400kHz, 100kHz
-#endif
+  Wire.setClock(400000);  // 400kHz (For SC16IS752)
 
-  // MAX14830 UART setup. (begin is excuted here instead of pzem creation)
-  serial0.begin(REF_BAUDRATE);
-  serial1.begin(REF_BAUDRATE);
-  serial2.begin(REF_BAUDRATE);
-  serial3.begin(REF_BAUDRATE);
+  // SC16IS752 UART setup. (begin is excuted here instead of pzem creation)
+  serial0.begin(SC_REF_BAUDRATE);
+  serial1.begin(SC_REF_BAUDRATE);
+  serial2.begin(SC_REF_BAUDRATE);
+  serial3.begin(SC_REF_BAUDRATE);
 
   // PZEM Initialization
   pzem0.init(&serial0, false, PZEM_DEFAULT_ADDR);
@@ -224,6 +216,7 @@ void setup() {
   // GPIO in SC16IS752 (need to init after pzem ?)
   dual_uart_led_init();
 
+#ifndef DISABLE_IR_FUNCTION
   // Just to know which program is running on my Arduino
   Serial.println(F("START " __FILE__ " from " __DATE__ "\r\nUsing library version " VERSION_IRREMOTE));
   Serial.print(F("Send IR signals at pin "));
@@ -231,7 +224,7 @@ void setup() {
 
   //IrSender.begin(); // Start with IR_SEND_PIN as send pin and if NO_LED_FEEDBACK_CODE is NOT defined, enable feedback LED at default feedback LED pin
   IrSender.begin(DISABLE_LED_FEEDBACK); // Start with IR_SEND_PIN as send pin and disable feedback LED at default feedback LED pin
-
+#endif
 }
 
 // Process this loop whenever we see a serial event or interrupt from the MAX14830
@@ -242,6 +235,7 @@ void loop() {
   Serial.println();
   Serial.println("PMS04 Board testing.");
   Serial.println("(C) 2023 Dignsys");
+  Serial.println();
 
   char c;
   while(c != 'x') {
@@ -290,7 +284,7 @@ void loop() {
         }
         break;
       case 'k':
-        sub_test_a(MAX14830_LSR_IRQSTS_REG);
+        //sub_test_a(MAX14830_LSR_IRQSTS_REG);
         break;
       case 'l':
         sub_test_l();
@@ -546,8 +540,6 @@ void dual_uart_led_init(void){
 
   uint8_t data[2] = {0,};
 
-//reg = (reg<<3)|(channel<<1);
-
   // device 0
   // IO Control
   i2c_read(SC16IS752_SADDR0, SC16IS7XX_IOCONTROL_REG<<3, data, 1);
@@ -730,7 +722,6 @@ int setAddress(char c, uint8_t* paddr, uint8_t* pch) {
 
   int ret = 0;
 
-  #ifdef USE_SC16IS752
   if(c == '0') {
     *paddr = SC16IS752_SADDR0; *pch = SC16IS752_CHANNEL_A;
   } else if (c == '1') {
@@ -742,28 +733,15 @@ int setAddress(char c, uint8_t* paddr, uint8_t* pch) {
   } else {
     ret = 1;
   }
-  #else
-  if(c == '0') {
-    *paddr = MAX14830_CH0;
-  } else if (c == '1') {
-    *paddr = MAX14830_CH1;
-  } else if (c == '2') {
-    *paddr = MAX14830_CH2;
-  } else if (c == '3') {
-    *paddr = MAX14830_CH3;
-  } else {
-    ret = 1;
-  }
-  #endif
 
   return ret;
 }
 
 void sub_test_a(uint8_t ireg) {
 
-  uint8_t address = MAX14830_CH0;
+  uint8_t address = SC16IS752_SADDR0;
   uint8_t channel;
-  uint8_t reg = MAX14830_REVID_REG;
+  uint8_t reg = 0;
   uint8_t out = 0;
   char c;
   Serial.println("Sub-test A - Read I2C");
@@ -828,9 +806,9 @@ void sub_test_a(uint8_t ireg) {
     Serial.println(c);
   }
 
-  #ifdef USE_SC16IS752
+  // Considering SC16IS752
   reg = (reg<<3)|(channel<<1);
-  #endif
+  
   Wire.beginTransmission(address);
   Wire.write(reg);
   Wire.endTransmission();
@@ -847,9 +825,9 @@ void sub_test_a(uint8_t ireg) {
 
 void sub_test_b(void) {
 
-  uint8_t address = MAX14830_CH0;
+  uint8_t address = SC16IS752_SADDR0;
   uint8_t channel;
-  uint8_t reg = MAX14830_REVID_REG;
+  uint8_t reg = 0;
   uint8_t val = 0;
   char c;
   Serial.println("Sub-test B - Write I2C");
@@ -943,9 +921,9 @@ void sub_test_b(void) {
   }
   Serial.println(c);
 
-  #ifdef USE_SC16IS752
+  // Considering SC16IS752
   reg = (reg<<3)|(channel<<1);
-  #endif
+  
   Wire.beginTransmission(address);
   Wire.write(reg);
   Wire.write(val);
@@ -961,7 +939,6 @@ int32_t sub_test_c_01(uint32_t f, int32_t *bestErr) {
 
   // Use baudRate 115200 for calculate error
   int32_t err = f % (460800 * 16);
-  //int32_t err = f % (38400 * 16);
 
   if ((*bestErr < 0) || (*bestErr > err)) {
     *bestErr = err;
@@ -974,7 +951,7 @@ int32_t sub_test_c_01(uint32_t f, int32_t *bestErr) {
 void sub_test_c(void) {
 
   uint8_t address;
-  uint32_t freq = REF_FREQ;
+  uint32_t freq = SC_REF_FREQ;
   bool xtal;
   uint32_t div, clksrc, pllcfg = 0;
   int32_t bestErr = -1;
@@ -982,7 +959,7 @@ void sub_test_c(void) {
 
   Serial.println("Sub-test C - Select Clock Setting");
   // Reset Port
-
+#if 0  // MAX14830 related code
   // First, update error without PLL
   sub_test_c_01(freq, &bestErr);
 
@@ -1026,7 +1003,7 @@ void sub_test_c(void) {
     Serial.print(", bestErr: "); Serial.println(bestErr, DEC);
   }
   Serial.print("pllcfg: "); Serial.println(pllcfg, HEX);
-
+#endif
 }
 
 void sub_test_d(void) {
@@ -1112,13 +1089,10 @@ uint16_t CRC16(const uint8_t *data, uint16_t len)
 
 void sub_test_e(void) {
 
-#ifdef USE_SC16IS752
   uint8_t addr = SC16IS752_SADDR0;
-#else
-  uint8_t addr = MAX14830_CH0;
-#endif
-  uint8_t tbuf[MAX_TX_BUF_SIZE] = {0,};
-  uint8_t rbuf[MAX_RX_BUF_SIZE] = {0,};
+
+  uint8_t tbuf[SC_TX_BUF_SIZE] = {0,};
+  uint8_t rbuf[SC_RX_BUF_SIZE] = {0,};
   uint16_t tlength = 8;
   uint16_t rlength = 8;
   uint8_t index = 0;
@@ -1163,11 +1137,7 @@ void sub_test_e(void) {
   
   while(tlength--) {
     Wire.beginTransmission(addr);
-    #ifdef USE_SC16IS752
     Wire.write((SC16IS7XX_THR_REG<<3)|(SC16IS752_CHANNEL_A<<1));
-    #else
-    Wire.write(MAX14830_THR_REG);
-    #endif
     Wire.write(tbuf[index]);
     Wire.endTransmission();
     index++;
@@ -1177,11 +1147,7 @@ void sub_test_e(void) {
 
   index = 0;
   Wire.beginTransmission(addr);
-  #ifdef USE_SC16IS752
   Wire.write((SC16IS7XX_RHR_REG<<3)|(SC16IS752_CHANNEL_A<<1));
-  #else
-  Wire.write(MAX14830_RHR_REG);
-  #endif
   Wire.endTransmission();
 
   Wire.requestFrom(addr, (uint8_t) rlength);
@@ -1199,12 +1165,8 @@ void sub_test_e(void) {
 
 void sub_test_f(void) {
 
-#ifdef USE_SC16IS752
   uint8_t addr = SC16IS752_SADDR0;
-#else
-  uint8_t addr = MAX14830_CH0;
-#endif
-  uint8_t tbuf[MAX_TX_BUF_SIZE] = {0,};
+  uint8_t tbuf[SC_TX_BUF_SIZE] = {0,};
   uint16_t length = 8;
   uint8_t index = 0;
   char c;
@@ -1272,11 +1234,7 @@ void sub_test_f(void) {
   
   while(length--) {
     Wire.beginTransmission(addr);
-    #ifdef USE_SC16IS752
     Wire.write((SC16IS7XX_THR_REG<<3)|(SC16IS752_CHANNEL_A<<1));
-    #else
-    Wire.write(MAX14830_THR_REG);
-    #endif
     Wire.write(tbuf[index]);
     Serial.print("tbuf["); Serial.print(index, DEC); Serial.print("]: "); Serial.println(tbuf[index], HEX);
     Wire.endTransmission();
@@ -1287,8 +1245,8 @@ void sub_test_f(void) {
 
 void sub_test_g(void) {
 
-  uint8_t addr = MAX14830_CH0;
-  uint8_t buf[MAX_RX_BUF_SIZE];
+  uint8_t addr = SC16IS752_SADDR0;
+  uint8_t buf[SC_RX_BUF_SIZE];
   uint16_t length = 8;
   uint8_t index = 0;
   char c;
@@ -1328,11 +1286,7 @@ void sub_test_g(void) {
   Serial.println(c);
 
   Wire.beginTransmission(addr);
-  #ifdef USE_SC16IS752
   Wire.write((SC16IS7XX_RHR_REG<<3)|(SC16IS752_CHANNEL_A<<1));
-  #else
-  Wire.write(MAX14830_RHR_REG);
-  #endif
   Wire.endTransmission();
 
   Wire.requestFrom(addr, (uint8_t) length);
@@ -1350,10 +1304,10 @@ void sub_test_g(void) {
 
 void sub_test_h(void) {
 
-  uint8_t addr = MAX14830_CH0;
+  uint8_t addr = SC16IS752_SADDR0;
   uint8_t channel;
-  uint8_t tbuf[MAX_TX_BUF_SIZE] = {0,};
-  uint8_t rbuf[MAX_RX_BUF_SIZE] = {0,};
+  uint8_t tbuf[SC_TX_BUF_SIZE] = {0,};
+  uint8_t rbuf[SC_RX_BUF_SIZE] = {0,};
   uint16_t tlength = 8;
   uint16_t rlength = 8;
   uint8_t index = 0;
@@ -1415,11 +1369,7 @@ void sub_test_h(void) {
   
   while(tlength--) {
     Wire.beginTransmission(addr);
-    #ifdef USE_SC16IS752
     Wire.write((SC16IS7XX_THR_REG<<3)|(channel<<1));
-    #else
-    Wire.write(MAX14830_THR_REG);
-    #endif
     Wire.write(tbuf[index]);
     Serial.print("tbuf["); Serial.print(index, DEC); Serial.print("]: "); Serial.println(tbuf[index], HEX);
     Wire.endTransmission();
@@ -1432,11 +1382,7 @@ void sub_test_h(void) {
 
   index = 0;
   Wire.beginTransmission(addr);
-  #ifdef USE_SC16IS752
   Wire.write((SC16IS7XX_RHR_REG<<3)|(channel<<1));
-  #else
-  Wire.write(MAX14830_RHR_REG);
-  #endif
   Wire.endTransmission();
 
   Wire.requestFrom(addr, (uint8_t) rlength);
@@ -1462,10 +1408,10 @@ void sub_test_h(void) {
 
 void sub_test_i(uint8_t iaddr) {
 
-  uint8_t addr = MAX14830_CH0;
+  uint8_t addr = SC16IS752_SADDR0;
   uint8_t channel;
-  uint8_t tbuf[MAX_TX_BUF_SIZE] = {0,};
-  uint8_t rbuf[MAX_RX_BUF_SIZE] = {0,};
+  uint8_t tbuf[SC_TX_BUF_SIZE] = {0,};
+  uint8_t rbuf[SC_RX_BUF_SIZE] = {0,};
   uint16_t tlength = 8;
   uint16_t rlength = 8;
   uint8_t index = 0;
@@ -1572,11 +1518,7 @@ void sub_test_i(uint8_t iaddr) {
   
   while(tlength--) {
     Wire.beginTransmission(addr);
-    #ifdef USE_SC16IS752
     Wire.write((SC16IS7XX_THR_REG<<3)|(channel<<1));
-    #else
-    Wire.write(MAX14830_THR_REG);
-    #endif
     Wire.write(tbuf[index]);
     Serial.print("tbuf["); Serial.print(index, DEC); Serial.print("]: "); Serial.println(tbuf[index], HEX);
     Wire.endTransmission();
@@ -1587,11 +1529,7 @@ void sub_test_i(uint8_t iaddr) {
 
   index = 0;
   Wire.beginTransmission(addr);
-  #ifdef USE_SC16IS752
   Wire.write((SC16IS7XX_RHR_REG<<3)|(channel<<1));
-  #else
-  Wire.write(MAX14830_RHR_REG);
-  #endif
   Wire.endTransmission();
 
   Wire.requestFrom(addr, (uint8_t) rlength);
@@ -2257,7 +2195,7 @@ void sub_test_p(void) {
 }
 
 void sub_test_q(void) {
-
+#ifndef DISABLE_IR_FUNCTION
   char c;
   /*
    * Set up the data to be sent.
@@ -2309,11 +2247,11 @@ void sub_test_q(void) {
     Serial.println("Invalid Test Number");
     return;
   }
-
+#endif
 }
 
 void sub_test_y(void) {
-  uint8_t buf[MAX_TX_BUF_SIZE] = {0,};
+  uint8_t buf[SC_TX_BUF_SIZE] = {0,};
   uint8_t length = 0;
   char c;
   Serial.println("Sub-test Y - CRC check");

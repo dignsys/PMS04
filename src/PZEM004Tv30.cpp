@@ -111,14 +111,7 @@ PZEM004Tv30::PZEM004Tv30(Stream& port, uint8_t addr)
 */
 #if defined(ESP32)
   #if defined(PZEM004_I2C_SERIAL)
-  #ifdef USE_SC16IS752
 PZEM004Tv30::PZEM004Tv30(SC16IS752Serial& port)
-{
-    //port.begin(PZEM_BAUD_RATE);
-    //init((Stream*)&port, false, PZEM_DEFAULT_ADDR);
-}
-  #endif
-PZEM004Tv30::PZEM004Tv30(MAX14830Serial& port)
 {
     //port.begin(PZEM_BAUD_RATE);
     //init((Stream*)&port, false, PZEM_DEFAULT_ADDR);
@@ -407,11 +400,7 @@ bool PZEM004Tv30::getPowerAlarm()
  * @return success
 */
 #ifdef PZEM004_I2C_SERIAL
-#ifdef USE_SC16IS752
 void PZEM004Tv30::init(SC16IS752Serial* port, bool isSoft, uint8_t addr){
-#else
-void PZEM004Tv30::init(MAX14830Serial* port, bool isSoft, uint8_t addr){
-#endif
 #else
 void PZEM004Tv30::init(Stream* port, bool isSoft, uint8_t addr){
 #endif
