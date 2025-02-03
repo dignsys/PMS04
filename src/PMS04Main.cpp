@@ -1,5 +1,5 @@
 /* 
- * PMS04 Main 
+ * PMS[01/04] Main 
  * Author : DIGNSYS Inc.
  */
 
@@ -10,27 +10,51 @@
 #include <AsyncDelay.h>
 #include <SPI.h>
 #include <Ethernet_Generic.h>
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <LittleFS.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-#define DISABLE_IR_FUNCTION
-
+//#define DISABLE_IR_FUNCTION
 #ifndef DISABLE_IR_FUNCTION
-#define DECODE_NEC
-//#define DECODE_DENON
-#define DISABLE_CODE_FOR_RECEIVER // Disables restarting receiver after each send. Saves 450 bytes program memory and 269 bytes RAM if receiving functions are not used.
-//#define SEND_PWM_BY_TIMER         // Disable carrier PWM generation in software and use (restricted) hardware PWM.
-//#define USE_NO_SEND_PWM           // Use no carrier PWM, just simulate an active low receiver signal. Overrides SEND_PWM_BY_TIMER definition
-#include <IRremote.hpp>
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+#endif
+
+#define VERSION_PMS_FW  "20250131"
+
+#define SYS_PMS01     1
+#define SYS_PMS04     4
+#define SYS_PMS_HW    SYS_PMS01
+//#define SYS_PMS_HW   SYS_PMS04
+
+#define PMS04_BOARD_VER_2_0
+
+//#define ENABLE_PM_LED_TOGGLE
+
+#if (SYS_PMS_HW == SYS_PMS04)
+const char* product_name = "PMS04";
+#else
+const char* product_name = "PMS01";
 #endif
 
 SC16IS752Serial serial0 = SC16IS752Serial(0);
 SC16IS752Serial serial1 = SC16IS752Serial(1);
+#if (SYS_PMS_HW == SYS_PMS04)
 SC16IS752Serial serial2 = SC16IS752Serial(2);
 SC16IS752Serial serial3 = SC16IS752Serial(3);
+#endif
 
 PZEM004Tv30 pzem0(serial0);
 PZEM004Tv30 pzem1(serial1);
+#if (SYS_PMS_HW == SYS_PMS04)
 PZEM004Tv30 pzem2(serial2);
 PZEM004Tv30 pzem3(serial3);
+#endif
 
 uint8_t rx_buf[SC_RX_BUF_SIZE];
 uint8_t tx_buf[SC_TX_BUF_SIZE];
@@ -78,14 +102,20 @@ uint16_t CRC16(const uint8_t *data, uint16_t len);
 #define PIN_ETH_MOSI      19  //23
 
 #define PIN_PCM_CONTROL   27
+
 #define PIN_GPIO          32
 #define PIN_IR            33
-#define IR_SEND_PIN       PIN_IR
+
+#ifndef DISABLE_IR_FUNCTION
+IRsend IrSender(PIN_IR);
+#endif
 
 #define I2C_ADDR_RTC    0x68
 
 uint8_t rtc_tx_buf[16];
 uint8_t rtc_rx_buf[16];
+uint8_t str_cur_date[9] = {0,};
+uint8_t str_cur_time[9] = {0,};
 
 #define I2C_ADDR_IO     0x20
 
@@ -100,10 +130,17 @@ uint8_t nc_mac[] = {
   0x00, 0x08, 0xDC, 0x00, 0x00, 0x00
 //  0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED
 };
+enum {
+  IP_TYPE_DHCP,
+  IP_TYPE_STATIC
+};
+
 IPAddress nc_ip(192, 168, 1, 35);
-IPAddress nc_dns(192, 168, 1, 1);
+IPAddress nc_dns(8, 8, 8, 8);
 IPAddress nc_gateway(192, 168, 1, 1);
 IPAddress nc_subnet(255, 255, 255, 0);
+IPAddress nc_server(192, 168, 1, 200);
+uint8_t nc_ip_type = IP_TYPE_STATIC;
 
 SPIClass* pspi;
 DhcpClass* dhcp = new DhcpClass();
@@ -120,12 +157,14 @@ int i2c_write(uint8_t addr, uint8_t reg, uint8_t* pdata, uint8_t dlen);
 int i2c_read_sw(uint8_t addr, uint8_t reg, uint8_t* pdata, uint8_t dlen);
 int i2c_write_sw(uint8_t addr, uint8_t reg, uint8_t* pdata, uint8_t dlen);
 
-#define LED_ON      1
-#define LED_OFF     0
-#define ETH_RST_ON  1
-#define ETH_RST_OFF 0
-#define SWITCH_ON   1
-#define SWITCH_OFF  0
+#define LED_ON        1
+#define LED_OFF       0
+#define ETH_RST_ON    1
+#define ETH_RST_OFF   0
+#define SWITCH_ON     1
+#define SWITCH_OFF    0
+#define PM_ACTIVE     1
+#define PM_INACTIVE   0
 
 void gpio_exp_conf(void);
 void gpio_exp_read(uint16_t* pdata);
@@ -138,10 +177,122 @@ void led_fail(uint8_t on);
 
 void eth_rst(void);
 
-int get_swtich_val(uint8_t num);
+int get_switch_val(uint8_t num);
 
 void dual_uart_led_init(void);
 void dual_uart_led_set(uint8_t num, uint8_t on);
+
+#define EEPROM_SIZE           512
+#define EEPROM_ADDR_SN        32
+
+const char* na_str = "***";
+
+char gv_ssid[32] = {0,};
+char gv_passwd[32] = {0,};
+char gv_mqtt[32] = {0,};
+
+// NTP Configuration
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = 3600 * 9;  // KST (UTC+9)
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+//#define USE_FIXED_WIFI_MQTT
+const char* WIFI_SSID = "TEST_AP";
+const char* WIFI_PASSWORD = "ap_password";
+
+const char* MQTT_SERVER = "broker.emqx.io";
+//const char* MQTT_SERVER = "192.168.1.187";  // Local MQTT server IP
+const int MQTT_PORT = 1883;
+const char* MQTT_TOPIC = "pms01/power";
+
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
+void connectToMQTT(void);
+void mqtt_callback(char* topic, byte* message, unsigned int length);
+
+StaticJsonDocument<200> doc;
+
+uint8_t wifi_connected = 0;
+uint8_t mqtt_access = 1;
+
+float gvf_voltage = 0.;
+float gvf_current = 0.;
+float gvf_power = 0.;
+float gvf_energy = 0.;
+float gvf_frequency = 0.;
+float gvf_pf = 0.;
+
+WebServer server(80);
+bool fsFound = false;
+
+//holds the current upload
+File fsUploadFile;
+String FileName;
+
+String HTML = "<form method='post' action='/upload' enctype='multipart/form-data'><input type='file' name='upload'><input type='submit' value='Upload'></form>";  
+
+#define FILEBUFSIZ 4096
+
+const char* host = "PMSMGR";
+String logStr = "Session start:\n";
+char tempBuf[256];
+
+// main page JS scripts 
+const char edit_script[] PROGMEM = R"rawliteral(
+<script>
+  var fName; 
+  function doEdit(item) 
+  {
+    console.log('clicked', item); 
+    fName = item;
+    var fe = document.getElementById("nameSave");
+    fe.value = fName;
+  } 
+  function saveFile()
+  {
+    console.log('Save', fName);
+  }
+  function scrollToBottom(el) // log window
+  {
+    //console.log("scrolling", el);
+    var element = document.getElementById(el);
+    element.scrollTop = element.scrollHeight;   
+  }
+</script>
+)rawliteral";
+
+void listDir(fs::FS &fs, const char * dirname, uint8_t levels);
+void createDir(fs::FS &fs, const char * path);
+void removeDir(fs::FS &fs, const char * path);
+void readFile(fs::FS &fs, const char * path);
+void writeFile(fs::FS &fs, const char * path, const char * message);
+void appendFile(fs::FS &fs, const char * path, const char * message);
+void renameFile(fs::FS &fs, const char * path1, const char * path2);
+void deleteFile(fs::FS &fs, const char * path);
+void writeFile2(fs::FS &fs, const char * path, const char * message);
+void deleteFile2(fs::FS &fs, const char * path);
+void testFileIO(fs::FS &fs, const char * path);
+size_t LittleFSFilesize(const char* filename);
+std::string ReadFileToString(const char* filename);
+String formatBytes(size_t bytes);
+void handleFileSysFormat(void);
+String getContentType(String filename);
+bool exists(String path);
+bool handleFileRead(String path);
+void handleFileUpload(void);
+void handleFileDelete(void);
+void handleFileCreate(void);
+void handleMain(void);
+bool initFS(bool format, bool force);
+void lfs_log(char* pmsg);
+
+void init_ethernet(void);
+void init_settings(void);
+void update_settings(void);
+void load_settings(void);
+void update_serial_number(char* pstr);
+void load_serial_number(char* pstr);
 
 void sub_test_a(uint8_t ireg);
 void sub_test_b(void);
@@ -159,8 +310,105 @@ void sub_test_n(void);
 void sub_test_o(void);
 void sub_test_p(void);
 void sub_test_q(void);
+void sub_test_r(void);
+void sub_test_s(void);
+void sub_test_t(void);
+void sub_test_v(void);
 void sub_test_y(void);
 void sub_test_z(void);
+void sub_test_loop(void);
+void sub_task_mqtt_pub(void);
+
+void prt_cmd_info_all(void){
+
+  Serial.println("l: RTC Test");
+  Serial.println("m: IO & Expander Test");
+  Serial.println("n: Network Function Test");
+  Serial.println("o: UART TX Test");
+  Serial.println("p: UART RX Test");
+  Serial.println("q: IR Test");
+  Serial.println("r: EEPROM Test");
+  Serial.println("s: LittleFS Test");
+  Serial.println("t: Web Server Test");
+  Serial.println("v: Settings Test");
+  Serial.println("#: Return to Main Loop");
+  Serial.println();
+}
+
+void prt_cmd_info_l(void){
+
+  Serial.println("3: set (time value should be set in the source code)");
+  Serial.println("4: Read RTC time value");
+  Serial.println("5: Set system time through NTP");
+  Serial.println("6: Set RTC time through system time");
+  Serial.println();
+}
+
+void prt_cmd_info_m(void){
+
+  Serial.println("0: Read SW3 DIP Switch (ON: Low, OFF: High)");
+  Serial.println("1: Front LED Blink Test");
+  Serial.println("5: GPIO (CON2) to HIGH");
+  Serial.println("6: GPIO (CON2) to LOW");
+  Serial.println("7: PCM Control to HIGH - AC Power-ON");
+  Serial.println("8: PCM Control to LOW - AC Power-OFF");
+  Serial.println();
+}
+
+void prt_cmd_info_n(void){
+
+  Serial.println("3: Initialize network setting");
+  Serial.println("4: Check network port status");
+  Serial.println("7: Set DHCP");
+  Serial.println("9: MQTT connection");
+  Serial.println();
+}
+
+void prt_cmd_info_o(void){
+
+  Serial.println("RS232(CON4) TX or RS485(CON3) TX");
+  Serial.println("  Press # to return to main loop during transmitting data");
+  Serial.println();
+}
+
+void prt_cmd_info_p(void){
+
+  Serial.println("RS232(CON4) RX or RS485(CON3) RX");
+  Serial.println("  Press # to return to main loop during receiving data");
+  Serial.println();
+}
+
+void prt_cmd_info_q(void){
+
+  Serial.println("1: Send NEC Raw 32bit Data");
+  Serial.println();
+}
+
+void prt_cmd_info_r(void){
+
+  Serial.println("0: Read 512 bytes");
+  Serial.println("1: Write 512 sequential data");
+  Serial.println();
+}
+
+void prt_cmd_info_s(void){
+
+}
+
+void prt_cmd_info_t(void){
+
+}
+
+void prt_cmd_info_v(void){
+
+  Serial.println("0: Initialize file system");
+  Serial.println("1: WLAN setting");
+  Serial.println("2: LAN setting");
+  Serial.println("3: Server setting");
+  Serial.println("4: SN setting");
+  Serial.println("5: MQTT Server setting");
+  Serial.println();
+}
 
 // Run this once at power on or reset.
 void setup() {
@@ -191,6 +439,14 @@ void setup() {
   pinMode(PIN_GPIO, OUTPUT);
   digitalWrite(PIN_GPIO, LOW);
 
+  // IR
+  pinMode(PIN_IR, OUTPUT);
+  digitalWrite(PIN_IR, LOW);
+
+  // PCM Control (LOW: AC Power-OFF, HIGH: AC Power-ON)
+  pinMode(PIN_PCM_CONTROL, OUTPUT);
+  digitalWrite(PIN_PCM_CONTROL, HIGH);
+
   // Arduino USART setup.
   Serial.begin(115200);
   Serial1.begin(115200, SERIAL_8N1, PIN_RS232_RXD, PIN_RS232_TXD);  // RS232
@@ -204,38 +460,300 @@ void setup() {
   // SC16IS752 UART setup. (begin is excuted here instead of pzem creation)
   serial0.begin(SC_REF_BAUDRATE);
   serial1.begin(SC_REF_BAUDRATE);
+#if (SYS_PMS_HW == SYS_PMS04)
   serial2.begin(SC_REF_BAUDRATE);
   serial3.begin(SC_REF_BAUDRATE);
+#endif
 
   // PZEM Initialization
   pzem0.init(&serial0, false, PZEM_DEFAULT_ADDR);
   pzem1.init(&serial1, false, PZEM_DEFAULT_ADDR);
+#if (SYS_PMS_HW == SYS_PMS04)
   pzem2.init(&serial2, false, PZEM_DEFAULT_ADDR);
   pzem3.init(&serial3, false, PZEM_DEFAULT_ADDR);
+#endif
 
   // GPIO in SC16IS752 (need to init after pzem ?)
   dual_uart_led_init();
 
 #ifndef DISABLE_IR_FUNCTION
-  // Just to know which program is running on my Arduino
-  Serial.println(F("START " __FILE__ " from " __DATE__ "\r\nUsing library version " VERSION_IRREMOTE));
-  Serial.print(F("Send IR signals at pin "));
-  Serial.println(IR_SEND_PIN);
-
-  //IrSender.begin(); // Start with IR_SEND_PIN as send pin and if NO_LED_FEEDBACK_CODE is NOT defined, enable feedback LED at default feedback LED pin
-  IrSender.begin(DISABLE_LED_FEEDBACK); // Start with IR_SEND_PIN as send pin and disable feedback LED at default feedback LED pin
+  IrSender.begin();
 #endif
+
+  // initialize EEPROM with predefined size
+  EEPROM.begin(EEPROM_SIZE);
+
+  fsFound = initFS(false, false); // is an FS already in place?
+  if(fsFound){
+    LittleFS.exists("/init.txt");
+    load_settings();
+  }
+
+  esp_read_mac(nc_mac, ESP_MAC_ETH);
+
+#ifdef USE_FIXED_WIFI_MQTT
+  strcpy(gv_ssid, WIFI_SSID);
+  strcpy(gv_passwd, WIFI_PASSWORD);
+  strcpy(gv_mqtt, MQTT_SERVER);
+#endif
+
+  if(gv_ssid[0]){
+    WiFi.begin(gv_ssid, gv_passwd);
+    Serial.println("WiFi starting");
+    // Wait for connection
+    int cnt = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+      if(++cnt > 120) break;
+    }
+
+    if((WiFi.status() == WL_CONNECTED)){
+      Serial.println("");
+      Serial.print("Connected to ");
+      Serial.println(gv_ssid);
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+
+      wifi_connected = 1;
+
+      // Initialize time
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo)) {
+        Serial.printf("Current time: %s", asctime(&timeinfo));
+      } else {
+        Serial.println("Failed to obtain time");
+      }
+
+      mqtt_client.setServer(gv_mqtt, MQTT_PORT);
+      mqtt_client.setCallback(mqtt_callback);
+      Serial.printf("Set MQTT Server: %s\n", gv_mqtt);
+    }
+  }
 }
 
-// Process this loop whenever we see a serial event or interrupt from the MAX14830
+// Process this loop whenever we see a serial event or interrupt from the SC16IS752
 void loop() {
-  // put your main code here, to run repeatedly:
-  
-  // Display USART header on Arduino.
+
   Serial.println();
-  Serial.println("PMS04 Board testing.");
+  Serial.printf("%s Main Loop\r\n", product_name);
   Serial.println("(C) 2023 Dignsys");
+  Serial.printf("VERSION: %s\r\n\r\n", VERSION_PMS_FW);
+  Serial.printf("Press # to enter sub-test loop\r\n\r\n");
+
+  char c = 0;
+  int idx=0;
+  int log_idx=0;
+  uint8_t addr;
+  PZEM004Tv30* ppzem[4];
+  char log_msg[256] = {0,};
+  uint8_t pm_active[4] = {0,};
+  uint8_t pm_led_toggle[4] = {0,};
+  uint8_t led_toggle = 0;
+  int cnt_mqtt_pub = 0;
+
+#if (SYS_PMS_HW == SYS_PMS04)
+#ifdef PMS04_BOARD_VER_2_0
+  ppzem[0] = &pzem0;
+  ppzem[1] = &pzem1;
+  ppzem[2] = &pzem2;
+  ppzem[3] = &pzem3;
+#else
+  ppzem[0] = &pzem3;
+  ppzem[1] = &pzem2;
+  ppzem[2] = &pzem1;
+  ppzem[3] = &pzem0;
+#endif
+#elif (SYS_PMS_HW == SYS_PMS01)
+  ppzem[0] = &pzem0;
+#endif
+
+  while(1) {
+
+    if(Serial.available()) {
+      c = Serial.read();
+    }
+    if(c == '#'){
+      Serial.println("Go to Sub Test!!!");
+      sub_test_loop();
+      Serial.println("Return to Main Loop!!!");
+      c = 0;
+    }
+
+    // PZEM Address Check
+    led_tx(LED_ON);
+    addr = ppzem[idx]->readAddress();
+    Serial.print("Custom Address[PM-"); Serial.print(idx+1); Serial.print("]: ");
+    Serial.println(addr, HEX);
+    led_tx(LED_OFF);
+
+    if(!log_idx){
+      memset(log_msg, 0x00, sizeof(log_msg));
+      sprintf(log_msg, "Custom Address[PM-%d]: %02x", idx+1, addr);
+      lfs_log(log_msg);
+    }
+
+    if(addr) {
+
+      //led_pm(idx+1, LED_ON);
+      pm_active[idx] = PM_ACTIVE;
+
+      // Read the data from the sensor
+      led_rx(LED_ON);
+      float voltage = ppzem[idx]->voltage();
+      float current = ppzem[idx]->current();
+      float power = ppzem[idx]->power();
+      float energy = ppzem[idx]->energy();
+      float frequency = ppzem[idx]->frequency();
+      float pf = ppzem[idx]->pf();
+      led_rx(LED_OFF);
+
+      // Check if the data is valid
+      if(isnan(voltage)){
+          Serial.println("Error reading voltage");
+      } else if (isnan(current)) {
+          Serial.println("Error reading current");
+      } else if (isnan(power)) {
+          Serial.println("Error reading power");
+      } else if (isnan(energy)) {
+          Serial.println("Error reading energy");
+      } else if (isnan(frequency)) {
+          Serial.println("Error reading frequency");
+      } else if (isnan(pf)) {
+          Serial.println("Error reading power factor");
+      } else {
+
+        gvf_voltage = voltage;
+        gvf_current = current;
+        gvf_power = power;
+        gvf_energy = energy;
+        gvf_frequency = frequency;
+        gvf_pf = pf;
+
+        // Print the values to the Serial console
+        Serial.print("Voltage: ");      Serial.print(voltage);      Serial.println("V");
+        Serial.print("Current: ");      Serial.print(current);      Serial.println("A");
+        Serial.print("Power: ");        Serial.print(power);        Serial.println("W");
+        Serial.print("Energy: ");       Serial.print(energy,3);     Serial.println("kWh");
+        Serial.print("Frequency: ");    Serial.print(frequency, 1); Serial.println("Hz");
+        Serial.print("PF: ");           Serial.println(pf);
+
+      }
+      //led_pm(idx+1, LED_OFF);
+    }
+    else{
+      //led_pm(idx+1, LED_OFF);
+      pm_active[idx] = PM_INACTIVE;
+    }
+
+    Serial.println();
+
+    if(wifi_connected && mqtt_access){
+      if (!mqtt_client.connected()) {
+        connectToMQTT();
+      }
+      if(++cnt_mqtt_pub > 60){
+        sub_task_mqtt_pub();
+        cnt_mqtt_pub = 0;
+      } else {
+        Serial.printf("MQTT Pub Count: %d\n", cnt_mqtt_pub);
+      }
+      mqtt_client.loop();
+    }
+
+    if(led_toggle){
+      led_toggle = 0;
+#if (SYS_PMS_HW == SYS_PMS04)
+      dual_uart_led_set(4, LED_ON);
+      dual_uart_led_set(5, LED_OFF);
+#endif
+      dual_uart_led_set(2, LED_ON);
+      dual_uart_led_set(3, LED_OFF);
+    } else {
+      led_toggle = 1;
+#if (SYS_PMS_HW == SYS_PMS04)
+      dual_uart_led_set(4, LED_OFF);
+      dual_uart_led_set(5, LED_ON);
+#endif
+      dual_uart_led_set(2, LED_OFF);
+      dual_uart_led_set(3, LED_ON);
+    }
+
+#if (SYS_PMS_HW == SYS_PMS04)
+    for(int i = 0; i < 4; i++){
+      //Serial.printf("idx:%d, PM_Active (%d) - Toggle (%d)\r\n", i, pm_active[i], pm_led_toggle[i]);
+      if(pm_active[i]) {
+        if(pm_led_toggle[i]) {
+          pm_led_toggle[i] = 0;
+#ifdef ENABLE_PM_LED_TOGGLE
+          led_pm(i+1, LED_OFF);
+#else
+          led_pm(i+1, LED_ON);
+#endif
+        } else {
+          pm_led_toggle[i] = 1;
+          led_pm(i+1, LED_ON);
+        }
+      } else {
+        pm_led_toggle[i] = 0;
+        led_pm(i+1, LED_OFF);
+      }
+    }
+    if(pm_active[0] && pm_active[1] && pm_active[2] && pm_active[3]){
+      led_fail(LED_OFF);
+    } else {
+      led_fail(LED_ON);
+    }
+#elif  (SYS_PMS_HW == SYS_PMS01)
+    if(pm_active[0]){
+      if(pm_led_toggle[0]) {
+        pm_led_toggle[0] = 0;
+#ifdef ENABLE_PM_LED_TOGGLE
+        led_pm(1, LED_OFF);
+#else
+        led_pm(1, LED_ON);
+#endif
+      } else {
+        pm_led_toggle[0] = 1;
+        led_pm(1, LED_ON);
+      }
+
+      led_fail(LED_OFF);
+    } else {
+      led_fail(LED_ON);
+    }
+#endif
+
+#if (SYS_PMS_HW == SYS_PMS04)
+    if(++idx > 3){
+      idx = 0;
+      if(++log_idx > 10){
+        log_idx = 0;
+      }
+    }
+#elif (SYS_PMS_HW == SYS_PMS01)
+    if(++log_idx > 40){
+      log_idx = 0;
+    }
+#endif
+
+    delay(1000);
+
+  }
+  Serial.println("loop exit!");
+
+}
+
+void sub_test_loop() {
+
   Serial.println();
+  Serial.printf("%s Board Sub-testing.\r\n", product_name);
+  Serial.println("(C) 2023 Dignsys");
+  Serial.printf("VERSION: %s\r\n\r\n", VERSION_PMS_FW);
+
+  prt_cmd_info_all();
 
   char c;
   while(c != 'x') {
@@ -243,13 +761,18 @@ void loop() {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c) || (c == '#')){
+          break;
+        }
       }
       delay(100);
     }
     Serial.printf("%c", c);
     Serial.println();
 
+    if(c == '#') {
+      break;
+    }
     switch(c) {
       case 'a': 
         sub_test_a(0);
@@ -283,9 +806,6 @@ void loop() {
           sub_test_i((uint8_t)i);
         }
         break;
-      case 'k':
-        //sub_test_a(MAX14830_LSR_IRQSTS_REG);
-        break;
       case 'l':
         sub_test_l();
         break;
@@ -304,6 +824,18 @@ void loop() {
       case 'q':
         sub_test_q();
         break;
+      case 'r':
+        sub_test_r();
+        break;
+      case 's':
+        sub_test_s();
+        break;
+      case 't':
+        sub_test_t();
+        break;
+      case 'v':
+        sub_test_v();
+        break;
       case 'y':
         sub_test_y();
         break;
@@ -316,7 +848,6 @@ void loop() {
   }
   Serial.println("loop exit!");
 
-  sleep(1000);
 }
 
 int i2c_read(uint8_t addr, uint8_t reg, uint8_t* pdata, uint8_t dlen){
@@ -513,7 +1044,7 @@ void eth_rst(void){
 
 }
 
-int get_swtich_val(uint8_t num){
+int get_switch_val(uint8_t num){
 
   int ret = 0;
   uint16_t num_bit;
@@ -556,6 +1087,7 @@ void dual_uart_led_init(void){
   data[0] &= 0xfc;
   i2c_write(SC16IS752_SADDR0, SC16IS7XX_IOSTATE_REG<<3, data, 1);
 
+#if (SYS_PMS_HW == SYS_PMS04)
   // device 1
   // IO Control
   i2c_read(SC16IS752_SADDR1, SC16IS7XX_IOCONTROL_REG<<3, data, 1);
@@ -571,6 +1103,7 @@ void dual_uart_led_init(void){
   i2c_read(SC16IS752_SADDR1, SC16IS7XX_IOSTATE_REG<<3, data, 1);
   data[0] &= 0xfc;
   i2c_write(SC16IS752_SADDR1, SC16IS7XX_IOSTATE_REG<<3, data, 1);
+#endif
 
 }
 
@@ -578,10 +1111,17 @@ void dual_uart_led_set(uint8_t num, uint8_t on){
 
   uint8_t data[2] = {0,};
 
+#if (SYS_PMS_HW == SYS_PMS04)
   if((num < 2) || (num > 5)){
     Serial.print("Invalid Dual Uart LED[2~5] Set:"); Serial.println(num);
     return;
   }
+#elif (SYS_PMS_HW == SYS_PMS01)
+  if((num < 2) || (num > 3)){
+    Serial.print("Invalid Dual Uart LED[2~3] Set:"); Serial.println(num);
+    return;
+  }
+#endif
 
   if(num == 2){
     if(on == LED_ON){
@@ -705,6 +1245,11 @@ void readTime(void)
   Serial.print(':');
   printTwoDigit(second);
   Serial.println();
+
+  sprintf((char*) str_cur_date, "%02d-%02d-%02d", year, month, dateOfMonth);
+  sprintf((char*) str_cur_time, "%02d:%02d:%02d", hour, minute, second);
+  Serial.printf("cur_date: %s\r\n", str_cur_date);
+  Serial.printf("cur_time: %s\r\n", str_cur_time);
 }
 
 void setRS485Dir(bool dir) {
@@ -737,6 +1282,905 @@ int setAddress(char c, uint8_t* paddr, uint8_t* pch) {
   return ret;
 }
 
+void listDir(fs::FS &fs, const char * dirname, uint8_t levels){
+  Serial.printf("Listing directory: %s\r\n", dirname);
+
+  File root = fs.open(dirname);
+  if(!root){
+    Serial.println("- failed to open directory");
+    return;
+  }
+  if(!root.isDirectory()){
+    Serial.println(" - not a directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while(file){
+    if(file.isDirectory()){
+      Serial.print("  DIR : ");
+      Serial.println(file.name());
+      if(levels){
+        listDir(fs, file.path(), levels -1);
+      }
+    } else {
+      Serial.print("  FILE: ");
+      Serial.print(file.name());
+      Serial.print("\tSIZE: ");
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+void createDir(fs::FS &fs, const char * path){
+  Serial.printf("Creating Dir: %s\n", path);
+  if(fs.mkdir(path)){
+    Serial.println("Dir created");
+  } else {
+    Serial.println("mkdir failed");
+  }
+}
+
+void removeDir(fs::FS &fs, const char * path){
+  Serial.printf("Removing Dir: %s\n", path);
+  if(fs.rmdir(path)){
+    Serial.println("Dir removed");
+  } else {
+    Serial.println("rmdir failed");
+  }
+}
+
+void readFile(fs::FS &fs, const char * path){
+  Serial.printf("Reading file: %s\r\n", path);
+
+  File file = fs.open(path);
+  if(!file || file.isDirectory()){
+    Serial.println("- failed to open file for reading");
+    return;
+  }
+
+  Serial.println("- read from file:");
+  while(file.available()){
+    Serial.write(file.read());
+  }
+  file.close();
+}
+
+void writeFile(fs::FS &fs, const char * path, const char * message){
+  Serial.printf("Writing file: %s\r\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if(!file){
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("- file written");
+  } else {
+    Serial.println("- write failed");
+  }
+  file.close();
+}
+
+void appendFile(fs::FS &fs, const char * path, const char * message){
+  Serial.printf("Appending to file: %s\r\n", path);
+
+  File file = fs.open(path, FILE_APPEND);
+  if(!file){
+    Serial.println("- failed to open file for appending");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("- message appended");
+  } else {
+    Serial.println("- append failed");
+  }
+  file.close();
+}
+
+void renameFile(fs::FS &fs, const char * path1, const char * path2){
+  Serial.printf("Renaming file %s to %s\r\n", path1, path2);
+  if (fs.rename(path1, path2)) {
+    Serial.println("- file renamed");
+  } else {
+    Serial.println("- rename failed");
+  }
+}
+
+void deleteFile(fs::FS &fs, const char * path){
+  Serial.printf("Deleting file: %s\r\n", path);
+  if(fs.remove(path)){
+    Serial.println("- file deleted");
+  } else {
+    Serial.println("- delete failed");
+  }
+}
+
+// SPIFFS-like write and delete file, better use #define CONFIG_LITTLEFS_SPIFFS_COMPAT 1
+void writeFile2(fs::FS &fs, const char * path, const char * message){
+  if(!fs.exists(path)){
+		if (strchr(path, '/')) {
+            Serial.printf("Create missing folders of: %s\r\n", path);
+			char *pathStr = strdup(path);
+			if (pathStr) {
+				char *ptr = strchr(pathStr, '/');
+				while (ptr) {
+					*ptr = 0;
+					fs.mkdir(pathStr);
+					*ptr = '/';
+					ptr = strchr(ptr+1, '/');
+				}
+			}
+			free(pathStr);
+		}
+  }
+
+  Serial.printf("Writing file to: %s\r\n", path);
+  File file = fs.open(path, FILE_WRITE);
+  if(!file){
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  if(file.print(message)){
+    Serial.println("- file written");
+  } else {
+    Serial.println("- write failed");
+  }
+  file.close();
+}
+
+void deleteFile2(fs::FS &fs, const char * path){
+  Serial.printf("Deleting file and empty folders on path: %s\r\n", path);
+
+  if(fs.remove(path)){
+    Serial.println("- file deleted");
+  } else {
+    Serial.println("- delete failed");
+  }
+
+  char *pathStr = strdup(path);
+  if (pathStr) {
+    char *ptr = strrchr(pathStr, '/');
+    if (ptr) {
+      Serial.printf("Removing all empty folders on path: %s\r\n", path);
+    }
+    while (ptr) {
+      *ptr = 0;
+      fs.rmdir(pathStr);
+      ptr = strrchr(pathStr, '/');
+    }
+    free(pathStr);
+  }
+}
+
+void testFileIO(fs::FS &fs, const char * path){
+  Serial.printf("Testing file I/O with %s\r\n", path);
+
+  static uint8_t buf[512];
+  size_t len = 0;
+  File file = fs.open(path, FILE_WRITE);
+  if(!file){
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+
+  size_t i;
+  Serial.print("- writing" );
+  uint32_t start = millis();
+  for(i=0; i<2048; i++){
+    if ((i & 0x001F) == 0x001F){
+      Serial.print(".");
+    }
+    file.write(buf, 512);
+  }
+  Serial.println("");
+  uint32_t end = millis() - start;
+  Serial.printf(" - %u bytes written in %u ms\r\n", 2048 * 512, end);
+  file.close();
+
+  file = fs.open(path);
+  start = millis();
+  end = start;
+  i = 0;
+  if(file && !file.isDirectory()){
+    len = file.size();
+    size_t flen = len;
+    start = millis();
+    Serial.print("- reading" );
+    while(len){
+      size_t toRead = len;
+      if(toRead > 512){
+        toRead = 512;
+      }
+      file.read(buf, toRead);
+      if ((i++ & 0x001F) == 0x001F){
+        Serial.print(".");
+      }
+      len -= toRead;
+    }
+    Serial.println("");
+    end = millis() - start;
+    Serial.printf("- %u bytes read in %u ms\r\n", flen, end);
+    file.close();
+  } else {
+    Serial.println("- failed to open file for reading");
+  }
+}
+
+size_t LittleFSFilesize(const char* filename) {
+  auto file = LittleFS.open(filename, "r");
+  size_t filesize = file.size();
+  // Don't forget to clean up!
+  file.close();
+  return filesize;
+}
+
+std::string ReadFileToString(const char* filename) {
+  auto file = LittleFS.open(filename, "r");
+  size_t filesize = file.size();
+  // Read into temporary Arduino String
+  String data = file.readString();
+  // Don't forget to clean up!
+  file.close();
+  return std::string(data.c_str(), data.length());
+}
+
+//format bytes
+String formatBytes(size_t bytes) {
+  if (bytes < 1024) {
+    return String(bytes) + "B";
+  } else if (bytes < (1024 * 1024)) {
+    return String(bytes / 1024.0) + "KB";
+  } else if (bytes < (1024 * 1024 * 1024)) {
+    return String(bytes / 1024.0 / 1024.0) + "MB";
+  } else {
+    return String(bytes / 1024.0 / 1024.0 / 1024.0) + "GB";
+  }
+}
+
+void handleFileSysFormat() {
+	LittleFS.format();
+	server.send(200, "text/json", "format complete");
+}
+
+String getContentType(String filename) {
+  if (server.hasArg("download")) {
+    return "application/octet-stream";
+  } else if (filename.endsWith(".htm")) {
+    return "text/html";
+  } else if (filename.endsWith(".html")) {
+    return "text/html";
+  } else if (filename.endsWith(".css")) {
+    return "text/css";
+  } else if (filename.endsWith(".js")) {
+    return "application/javascript";
+  } else if (filename.endsWith(".png")) {
+    return "image/png";
+  } else if (filename.endsWith(".gif")) {
+    return "image/gif";
+  } else if (filename.endsWith(".jpg")) {
+    return "image/jpeg";
+  } else if (filename.endsWith(".ico")) {
+    return "image/x-icon";
+  } else if (filename.endsWith(".xml")) {
+    return "text/xml";
+  } else if (filename.endsWith(".pdf")) {
+    return "application/x-pdf";
+  } else if (filename.endsWith(".zip")) {
+    return "application/x-zip";
+  } else if (filename.endsWith(".gz")) {
+    return "application/x-gzip";
+  } else if (filename.endsWith(".png")) {
+    return "image/wav";
+  }
+  return "text/plain";
+}
+
+bool exists(String path){
+  bool yes = false;  
+  File file = LittleFS.open(path, "r");
+  if(!file.isDirectory()){
+    yes = true;
+  }
+  file.close();
+  return yes;
+}
+
+bool handleFileRead(String path) {
+  Serial.printf_P(PSTR("handleFileRead: %s\r\n"), path.c_str());
+  if(path.endsWith("/")) path += "";
+  String contentType = getContentType(path);
+  String pathWithGz = path + ".gz";
+  if(LittleFS.exists(pathWithGz) || LittleFS.exists(path))
+	{
+    if(LittleFS.exists(pathWithGz))
+      path += ".gz";
+    File file = LittleFS.open(path, "r");
+    size_t sent = server.streamFile(file, contentType);
+    file.close();
+		Serial.println("Read OK");
+    return true;
+  }
+	Serial.printf("Read failed '%s', type '%s'\n", path.c_str(), contentType.c_str()) ;
+  return false;
+}
+
+void handleFileUpload() {  
+  bool OK = false;
+  if(server.uri() != "/edit") return;
+ 
+  HTTPUpload& upload = server.upload();
+  if(upload.status == UPLOAD_FILE_START)
+  {
+    String filename = upload.filename;
+    if(!filename.startsWith("/")) filename = "/"+filename;
+    Serial.printf_P(PSTR("handleFileUpload Name: %s\r\n"), filename.c_str());
+    fsUploadFile = LittleFS.open(filename, "w");
+    filename = String();
+  } 
+  else if(upload.status == UPLOAD_FILE_WRITE)
+  {
+    Serial.printf_P(PSTR("handleFileUpload Data: %d\r\n"), upload.currentSize);
+    if(fsUploadFile)
+      fsUploadFile.write(upload.buf, upload.currentSize);
+  } 
+  else if(upload.status == UPLOAD_FILE_END)
+  {
+    if(fsUploadFile)
+      fsUploadFile.close();    
+    OK = true;
+    Serial.printf_P(PSTR("handleFileUpload Size: %d\r\n"), upload.totalSize);
+    sprintf(tempBuf,"File upload [%s] %s\n", upload.filename.c_str(), (OK)? "OK" : "failed");
+    logStr += tempBuf;
+  }
+}
+
+void handleFileDelete() {
+	if(!server.hasArg("file")) {server.send(500, "text/html", "<meta http-equiv='refresh' content='1;url=/main'>Bad arguments. <a href=/main>Back to list</a>"); return;}
+  //if(server.args() == 0) return server.send(500, "text/plain", "BAD ARGS");  
+	String path = server.arg("file");
+	//String path = server.arg(0);
+  Serial.printf_P(PSTR("handleFileDelete: '%s'\r\n"),path.c_str());
+  if(path == "/")
+    return server.send(500, "text/html", "<meta http-equiv='refresh' content='1;url=/main>Can't delete root directory. <a href=/main>Back to list</a>");
+  if(!LittleFS.exists(path))
+    return server.send(200, "text/html", "<meta http-equiv='refresh' content='1;url=/main'>File not found. <a href=/main>Back to list</a>");
+  LittleFS.remove(path);
+  server.send(200, "text/html", "<meta http-equiv='refresh' content='1;url=/main'>File deleted. <a href=/main>Back to list</a>");
+  logStr += "Deleted ";
+  logStr += path;
+  logStr +="\n";
+  path = String();
+}
+
+void handleFileCreate() {
+  if(server.args() == 0)
+    return server.send(500, "text/plain", "BAD ARGS");
+  String path = server.arg(0);
+  Serial.printf_P(PSTR("handleFileCreate: %s\r\n"),path.c_str());
+  if(path == "/")
+    return server.send(500, "text/plain", "BAD PATH");
+  if(LittleFS.exists(path))
+    return server.send(500, "text/plain", "FILE EXISTS");
+  if(!path.startsWith("/")) path = "/"+path;    // is this needed for LittleFS?
+  File file = LittleFS.open(path, "w");
+  if(file)
+	{
+    file.close();
+		Serial.printf("Created file [%s]\n",path.c_str());
+	}
+  else
+	{
+		Serial.printf("Create file [%s] failed\n",path.c_str());
+    return server.send(500, "text/plain", "CREATE FAILED");
+	}
+  server.send(200, "text/html", "<meta http-equiv='refresh' content='1;url=/main'>File created. <a href=/main>Back to list</a>");
+  logStr += "Created ";
+  logStr += path;
+  logStr +="\n";
+  path = String();
+}
+
+void handleMain() {
+  bool foundText = false;
+  bool foundName = false;
+  bool foundMode = false;
+  bool foundSaveBut = false;
+  char filebuf[FILEBUFSIZ];
+  char fileName[128];
+  File file;
+	String path = "", bText = "", bName = "", bMode ="";
+  String output = "";
+  // check arguments
+  if(server.hasArg("mode"))
+  {
+    bMode = server.arg("mode");
+    if(bMode.length() > 0) 
+      foundMode = true;
+    Serial.printf("Mode %s\n",bMode.c_str());
+  }
+  if(server.hasArg("dir"))// {server.send(500, "text/plain", "BAD ARGS"); return;}  
+		path = server.arg("dir");
+	else
+		path ="/";
+  if(server.hasArg("editBlock"))
+  {
+    bText = server.arg("editBlock");
+    if(bText.length() > 0) 
+      foundText = true;
+  }
+  
+  if(server.hasArg("nameSave"))
+  {
+    bName = server.arg("nameSave");
+    if(bName.length() > 0) 
+      foundName = true;
+    if(!bName.startsWith("/")) bName = "/"+ bName;    // is this needed for LittleFS?   
+  }
+  
+  if(server.hasArg("saveBut"))
+  {
+    foundSaveBut = true;
+  }
+
+  // write
+  if(foundName && foundText && bMode == "save")
+  {
+    Serial.println("something to save");
+    file = LittleFS.open(bName, "w");
+    if(file)
+    {
+      file.write((uint8_t *)bText.c_str(), bText.length());
+      file.close();
+      logStr += "Saved ";
+      logStr += bName;
+      logStr +="\n";
+    }  
+  }
+  Serial.printf_P(PSTR("handleMain: path [%s]\r\n"), path.c_str());
+  Serial.printf_P(PSTR("fname:[%s], %i\r\n"), bName.c_str(), foundName);
+  Serial.printf_P(PSTR("text [%s], %i\r\n"),  bText.c_str(), foundText);
+  Serial.printf_P(PSTR("mode [%s], %i\r\n"),  bMode.c_str(), foundMode);
+
+  File dir = LittleFS.open(path.c_str());
+  if(!dir)
+	  Serial.printf("Directory [%s]not found", path.c_str());
+	else if(!dir.isDirectory())
+        Serial.println(" - not a directory");
+	//path = String();
+
+  // Create HTML page
+  output = "<html><head>";
+  output += "</head><body onload='scrollToBottom(\"log\")'>\n";
+  output += "<span style='text-align: center;'><h2>PMS File Management</H2></span>";
+  output += "<table style='margin-left: auto;  margin-right: auto;border-collapse: collapse'>\n"; // style='border: 1px solid silver; border-collapse: collapse;'
+  
+  // FS format 
+  if(bMode == "format" && foundMode)
+  {
+    fsFound = initFS(true, true);
+    Serial.println("main: Done formatting");
+    logStr += "Formatted FS ";
+    logStr += "LittleFS";
+    logStr +="\n";      
+  }
+  output += "<tr><td style='background-color: #fff0ff; border: 1px solid silver;  padding: 5px;vertical-align:top;' colspan='2'><h3>";
+  output += "LittleFS";
+  output += " file system</h3>";
+  output += "LIttleFS";
+  output += " filesystem ";
+  if (!fsFound)
+    output += "not ";
+  output += "found.";
+  // format form
+  output += "<span style='text-align: right;'><form action='/main?mode=format' method='get' enctype='multipart/form-data'>"; 
+  output += "<input type='hidden' name='mode' value='format'>";
+  output += "<button>Format FS</button>";
+  output += "</form></span>";  
+  output += "</td></tr>\n";
+   
+  //file upload 
+  output += "<tr><td style='background-color: #e4ffe4; border: 1px solid silver;  padding: 5px;vertical-align:top;' colspan='2'><h3>";
+  output += "<h3>Upload files</h3><form action='/edit' method='post' enctype='multipart/form-data'><BR>"; // use post for PUT /edit server handler
+  output += "Name: <input type='file' name='data' required>";
+  output += "Path: <input type='text' name='path' value='/'>";
+  output += "<input type='hidden' name='mode' value='upload'>";
+  output += "<button>Upload</button>";
+  output += "</form>";
+  output += "</td></tr>\n";
+  
+  // file list and edit   
+  output += "<tr style='background-color: #ffffde; border: 1px solid silver;'><td style='padding:5px; vertical-align:top;'>";
+	output += "<h3>Files in directory '" + path + "'</h3>";
+	output += "<a href=/main>Back to root</a><br>"; // LittleFS only
+
+	File entry;
+  while(entry = dir.openNextFile())
+  {  
+	  bool isDir = entry.isDirectory(); // single level for SPIFFS, possibly not true for LittleFS
+    // output += (isDir) ? "dir:" : "file: ";
+    // output += "\t";
+		if(isDir) 
+		{
+			output += "<a href=/main?dir=/" ;
+			output +=  entry.name(); 
+			output +=  ">";
+		}
+    strcpy(fileName, entry.name());
+    output += String(entry.name());
+		if(isDir) 
+		  output += "</a>";
+		output += " (";
+    output += String(entry.size());
+		output += ")&nbsp;&nbsp;";
+    // edit
+    output += "<a href=/main?mode=edit&nameSave="; 
+    if(fileName[0] != '\\' && fileName[0] != '/') // avoid double \ or / in filename (on some OS)
+   	 output += path;
+    output += String(entry.name());
+    output += ">Edit</a>&nbsp;&nbsp;";
+    // delete
+    output += "<a href=/delete?file="; 
+    if(fileName[0] != '\\' && fileName[0] != '/') // avoid double \ or / in filename (on some OS)
+    output += path;
+    output += String(entry.name());
+    output += ">Delete</a><BR>";
+    entry.close();
+  }	
+  output += "</td>\n";  
+  // edit form - text, filename and submit
+  output += "<td style='padding: 5px;'><form action='/main' method='get'><textarea name=editBlock id=editBlock rows='30' cols='60'>";
+  
+  if(bMode = "edit")
+  {
+    // read file and insert content
+    file = LittleFS.open(bName.c_str(), "r");
+    if(file)
+    {
+      Serial.printf("File read avail %i, ",file.available());
+      int readlen = (file.available() < FILEBUFSIZ) ? file.available() : FILEBUFSIZ;   
+      file.read((uint8_t *)filebuf, readlen);
+      file.close();        
+      filebuf[readlen] = '\0';
+      output += filebuf;
+      //Serial.printf("read len %i, text [%s]\n",readlen, filebuf);
+      logStr += (foundSaveBut) ? "Saving " : "Editing ";
+      logStr += bName;
+      logStr +="\n";   
+    }
+  }
+  output += "</textarea><BR>\n";
+  output += "<input type=hidden name='mode' value='save'>";
+  output += "Filename: <input type=text value='";
+  if(bMode = "edit")
+    output += bName;        
+  output += "' name=nameSave id=nameSave> <input type=submit name=saveBut onclick=saveFile() value='Save'></form></td></tr>\n";
+  output += "<tr style='background-color: #ececff; border: 1px solid silver; vertical-align:top;'><td colspan=2 style='padding:5px; vertical-align:top;'>";
+  output += "Log: <form><textarea  name=log id=log rows='5' cols='85'>";
+  output += logStr;
+  output += "</textarea></form>";
+  output += "<BR><a href='/main'>Reload page</a>";
+  output += "</td></tr></table></body>";
+  output += edit_script;
+  output += "</html>";
+  //server.send(200, "text/json", output);
+  server.send(200, "text/html", output);
+}
+
+bool initFS(bool format = false, bool force = false) 
+{
+  bool fsFound = LittleFS.begin();
+  if(!fsFound) 
+    Serial.println(F("No file system found. Please format it."));
+     
+  if(!format)
+    return fsFound;
+  
+  // format
+	if(!fsFound || force)
+	{
+    Serial.println(F("Formatting FS."));
+	  if(LittleFS.format())
+    {
+		  if(LittleFS.begin())
+      {
+        Serial.println(F("Format complete."));
+        return true;
+      }
+    }      
+    Serial.println(F("Format failed."));
+    return false;              
+	}
+	//fsList();
+  return false; // shouldn't get here
+}
+
+void lfs_log(char* pmsg){
+
+  if(!fsFound) return;
+
+  readTime();
+
+  if(LittleFS.exists("/log_today.txt")){
+    // Check file date
+    File file = LittleFS.open("/log_today.txt");
+    String str_tmp = file.readStringUntil(0x0d);
+    file.close();
+    if(str_tmp.compareTo(String((char*) str_cur_date))){
+      Serial.printf("Diff: %s, %s\r\n", str_tmp.c_str(), str_cur_date);
+      if(LittleFS.exists("/log_past.txt")){
+        LittleFS.remove("/log_past.txt");
+      }
+      LittleFS.rename("/log_today.txt", "/log_past.txt");
+    } else {
+      Serial.printf("Same: %s, %s\r\n", str_tmp.c_str(), str_cur_date);
+    }
+  }
+
+  if(!LittleFS.exists("/log_today.txt")){
+    writeFile(LittleFS, "/log_today.txt", (String((char*) str_cur_date)+ "\r\n").c_str());
+  }
+  appendFile(LittleFS, "/log_today.txt", (String((char*) str_cur_time)+" - "+String(pmsg)+"\r\n").c_str());
+
+}
+
+void init_settings(void){
+
+  memset(gv_ssid, 0x00, sizeof(gv_ssid));
+  memset(gv_passwd, 0x00, sizeof(gv_passwd));
+  memset(gv_mqtt, 0x00, sizeof(gv_mqtt));
+
+  nc_ip.fromString("192.168.1.35");
+  nc_dns.fromString("8.8.8.8");
+  nc_gateway.fromString("192.168.1.1");
+  nc_subnet.fromString("255.255.255.0");
+  nc_server.fromString("192.168.1.200");
+  nc_ip_type = IP_TYPE_STATIC;
+
+}
+
+void update_settings(void){
+
+  uint8_t mdata[6] = {0,};
+  uint8_t sdata[32] = {0,};
+  uint8_t str_tmp[128] = {0,};
+
+  writeFile(LittleFS, "/init.txt", "=== PMS Settings ===\r\n");
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  if(gv_ssid[0]){
+    sprintf((char*) str_tmp, "[WLAN/SSID]: %s", gv_ssid);
+  } else {
+    sprintf((char*) str_tmp, "[WLAN/SSID]: ***");
+  }
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  if(gv_passwd[0]){
+    sprintf((char*) str_tmp, "[WLAN/PASSWD]: %s", gv_passwd);
+  } else {
+    sprintf((char*) str_tmp, "[WLAN/PASSWD]: ***");
+  }
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  if(nc_ip_type == IP_TYPE_STATIC){
+    sprintf((char*) str_tmp, "[LAN/Static|DHCP]: Static");
+  } else {
+    sprintf((char*) str_tmp, "[LAN/Static|DHCP]: DHCP");
+  }
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[LAN/IP]: %s", (nc_ip.toString()).c_str());
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[LAN/Subnet]: %s", (nc_subnet.toString()).c_str());
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[LAN/Gateway]: %s", (nc_gateway.toString()).c_str());
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[LAN/DNS]: %s", (nc_dns.toString()).c_str());
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[Server/IP]: %s", (nc_server.toString()).c_str());
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  esp_read_mac(mdata, ESP_MAC_WIFI_STA);
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  sprintf((char*) str_tmp, "[System/ID]: %02x:%02x:%02x:%02x:%02x:%02x", mdata[0], mdata[1], mdata[2], mdata[3], mdata[4], mdata[5]);
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  load_serial_number((char*) sdata);
+  sprintf((char*) str_tmp, "[System/SN]: %s", sdata);
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+  memset(str_tmp, 0x00, sizeof(str_tmp));
+  if(gv_mqtt[0]){
+    sprintf((char*) str_tmp, "[MQTT/IP]: %s", gv_mqtt);
+  } else {
+    sprintf((char*) str_tmp, "[MQTT/IP]: ***");
+  }
+  appendFile(LittleFS, "/init.txt", (String((char*) str_tmp)+ "\r\n").c_str());
+
+}
+
+void load_settings(void){
+
+  int slen = 0;
+  uint8_t str_tmp[128] = {0,};
+
+  File file = LittleFS.open("/init.txt");
+  if(!file || file.isDirectory()){
+    Serial.println("Fail to open init.txt");
+  }
+
+  file.find("[WLAN/SSID]:");
+  String str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+
+  if(0 != str_temp.compareTo(na_str)){
+    memset(gv_ssid, 0x00, sizeof(gv_ssid));
+    strcpy(gv_ssid, str_temp.c_str());
+  } else {
+    Serial.println("SSID is not valid");
+  }
+
+  file.find("[WLAN/PASSWD]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+
+  if(0 != str_temp.compareTo(na_str)){
+    memset(gv_passwd, 0x00, sizeof(gv_passwd));
+    strcpy(gv_passwd, str_temp.c_str());
+  } else {
+    Serial.println("PASSWD is not valid");
+  }
+
+  file.find("[LAN/Static|DHCP]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  str_temp.toLowerCase();
+  if(0 == str_temp.compareTo("static")){
+    nc_ip_type = IP_TYPE_STATIC;
+  } else if(0 == str_temp.compareTo("dhcp")){
+    nc_ip_type = IP_TYPE_DHCP;
+  } else {
+    nc_ip_type = IP_TYPE_STATIC;
+  }
+
+  file.find("[LAN/IP]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  nc_ip.fromString(str_temp);
+
+  file.find("[LAN/Subnet]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  nc_subnet.fromString(str_temp);
+
+  file.find("[LAN/Gateway]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  nc_gateway.fromString(str_temp);
+
+  file.find("[LAN/DNS]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  nc_dns.fromString(str_temp);
+
+  file.find("[Server/IP]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+  nc_server.fromString(str_temp);
+
+  file.find("[MQTT/IP]:");
+  str_temp = file.readStringUntil('\n');
+  str_temp.trim();
+
+  if(0 != str_temp.compareTo(na_str)){
+    memset(gv_mqtt, 0x00, sizeof(gv_mqtt));
+    strcpy(gv_mqtt, str_temp.c_str());
+  } else {
+    Serial.println("MQTT IP is not valid");
+  }
+
+  file.close();
+}
+
+void update_serial_number(char* pstr){
+
+  int slen;
+
+  slen = strlen(pstr);
+  
+  for(int i = 0; i < 16; i++){
+    if(i < slen){
+      EEPROM.write(EEPROM_ADDR_SN+i, pstr[i]);
+    } else {
+      EEPROM.write(EEPROM_ADDR_SN+i, 0x00);
+    }
+    Serial.printf("%d - STR_IN: %02x, EEPROM: %02x\r\n", i, pstr[i], EEPROM.read(EEPROM_ADDR_SN+i));
+  }
+  EEPROM.commit();
+
+}
+
+void load_serial_number(char* pstr){
+
+  for(int i = 0; i < 16; i++){
+    pstr[i] = EEPROM.read(EEPROM_ADDR_SN+i);
+    Serial.printf("EEPROM[%d]: %02x\r\n", i, pstr[i]);
+  }
+}
+
+void connectToMQTT(void) {
+
+  int rcnt = 0;
+  while (!mqtt_client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (mqtt_client.connect("PMS01Client")) {
+      Serial.printf(" connected\r\n");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt_client.state());
+      if(++rcnt > 3){
+        mqtt_access = 0;
+        break;
+      }
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void mqtt_callback(char* topic, byte* message, unsigned int length) {
+
+  String stMessage;
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)message[i]);
+    stMessage += (char)message[i];
+  }
+  Serial.println();
+}
+
+void sub_task_mqtt_pub(void) {
+
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char timestamp[24];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+  doc.clear();
+  doc["timestamp"] = timestamp;
+  doc["voltage"] = gvf_voltage;
+  doc["current"] = gvf_current;
+  doc["power"] = gvf_power;
+  doc["energy"] = gvf_energy;
+  doc["frequency"] = gvf_frequency;
+  doc["powerFactor"] = gvf_pf;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  if (mqtt_client.publish(MQTT_TOPIC, jsonString.c_str())) {
+    Serial.println("Data published to MQTT");
+  } else {
+    Serial.println("Failed to publish data");
+  }
+}
+
 void sub_test_a(uint8_t ireg) {
 
   uint8_t address = SC16IS752_SADDR0;
@@ -758,7 +2202,7 @@ void sub_test_a(uint8_t ireg) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
@@ -772,14 +2216,14 @@ void sub_test_a(uint8_t ireg) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -790,14 +2234,14 @@ void sub_test_a(uint8_t ireg) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -836,7 +2280,7 @@ void sub_test_b(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -851,14 +2295,14 @@ void sub_test_b(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
   c = tolower(c);
   if((c >= '0') && (c <= '9')) {
     reg = (c - '0')*0x10;
-  } else if ((c >= 'a') && (c <= 'z')) {
+  } else if ((c >= 'a') && (c <= 'f')) {
     reg = (c - 'a' + 0xa)*0x10;
   } else {
     Serial.println("Invalid input");
@@ -869,14 +2313,14 @@ void sub_test_b(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
   c = tolower(c);
   if((c >= '0') && (c <= '9')) {
     reg |= (c - '0');
-  } else if ((c >= 'a') && (c <= 'z')) {
+  } else if ((c >= 'a') && (c <= 'f')) {
     reg |= (c - 'a' + 0xa);
   } else {
     Serial.println("Invalid input");
@@ -888,14 +2332,14 @@ void sub_test_b(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
   c = tolower(c);
   if((c >= '0') && (c <= '9')) {
     val = (c - '0')*0x10;
-  } else if ((c >= 'a') && (c <= 'z')) {
+  } else if ((c >= 'a') && (c <= 'f')) {
     val = (c - 'a' + 0xa)*0x10;
   } else {
     Serial.println("Invalid input");
@@ -906,14 +2350,14 @@ void sub_test_b(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
   c = tolower(c);
   if((c >= '0') && (c <= '9')) {
     val |= (c - '0');
-  } else if ((c >= 'a') && (c <= 'z')) {
+  } else if ((c >= 'a') && (c <= 'f')) {
     val |= (c - 'a' + 0xa);
   } else {
     Serial.println("Invalid input");
@@ -1176,7 +2620,7 @@ void sub_test_f(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1195,14 +2639,14 @@ void sub_test_f(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       tbuf[i] = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       tbuf[i] = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1213,14 +2657,14 @@ void sub_test_f(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       tbuf[i] |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       tbuf[i] |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1256,7 +2700,7 @@ void sub_test_g(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1272,7 +2716,7 @@ void sub_test_g(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1318,7 +2762,7 @@ void sub_test_h(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1378,7 +2822,6 @@ void sub_test_h(void) {
 
   //Serial.print("Available right after Tx: "); Serial.println(Wire.available(), DEC);
   delay(200);
-  //Serial.print("Line Status Register: "); Serial.println(serial0.readRegister(addr, MAX14830_LSR_IRQSTS_REG), HEX);
 
   index = 0;
   Wire.beginTransmission(addr);
@@ -1427,7 +2870,7 @@ void sub_test_i(uint8_t iaddr) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
@@ -1442,14 +2885,14 @@ void sub_test_i(uint8_t iaddr) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1460,14 +2903,14 @@ void sub_test_i(uint8_t iaddr) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1552,12 +2995,13 @@ void sub_test_l(void) {
   int numBytes;
   char c;
   Serial.println("Sub-test L - RTC");
+  prt_cmd_info_l();
 
   Serial.print("Input Test Number: ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1592,25 +3036,25 @@ void sub_test_l(void) {
     data[0] = 0*0x10;   // 10 Seconds
     data[0] += 0;       // Seconds
 
-    data[1] = 5*0x10;   // 10 Minutes
-    data[1] += 1;       // Minutes
+    data[1] = 1*0x10;   // 10 Minutes
+    data[1] += 0;       // Minutes
 
     //data[2] = 0x40;   // 12-Hour Mode
     data[2] = 0x00;     // 24-Hour Mode
 
     data[2] += 1*0x10;  // 10 Hours
-    data[2] += 3;       // Hours
+    data[2] += 8;       // Hours
 
     data[3] = 5;        // Day (1~7), Monday first
 
-    data[4] = 2*0x10;   // 10 Date
-    data[4] += 2;       // Date
+    data[4] = 1*0x10;   // 10 Date
+    data[4] += 7;       // Date
 
     data[5] = 0*0x10;   // 10 Month
-    data[5] += 9;       // Month
+    data[5] += 1;       // Month
 
     data[6] = 2*0x10;   // 10 Year
-    data[6] += 3;       // Year
+    data[6] += 5;       // Year
     sw.beginTransmission(I2C_ADDR_RTC);
     sw.write(uint8_t(0));
     for (int i = 0; i < 8; ++i) {
@@ -1619,6 +3063,76 @@ void sub_test_l(void) {
     sw.endTransmission();
   } else if (c == '4') {  // Read Time
     readTime();
+  } else if (c == '5') {  // Set System Time through NTP
+    if(wifi_connected) {
+      // Initialize time
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo)) {
+        Serial.printf("Current time: %s", asctime(&timeinfo));
+      } else {
+        Serial.println("Failed to obtain time");
+      }
+    }
+  } else if (c == '6') {  // Set RTC through System Time
+    uint8_t udata = 0;
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      Serial.printf("Current time: %s", asctime(&timeinfo));
+      Serial.printf("Year: %d\n", timeinfo.tm_year%100);
+      Serial.printf("Month: %d\n", timeinfo.tm_mon);
+      Serial.printf("Date: %d\n", timeinfo.tm_wday);
+      Serial.printf("Day: %d\n", timeinfo.tm_mday);
+      Serial.printf("Hours: %d\n", timeinfo.tm_hour);
+      Serial.printf("Minutes: %d\n", timeinfo.tm_min);
+      Serial.printf("Seconds: %d\n", timeinfo.tm_sec);
+
+      udata = timeinfo.tm_sec/10;
+      data[0] = udata*0x10;   // 10 Seconds
+      udata = timeinfo.tm_sec%10;
+      data[0] += udata;       // Seconds
+
+      udata = timeinfo.tm_min/10;
+      data[1] = udata*0x10;   // 10 Minutes
+      udata = timeinfo.tm_min%10;
+      data[1] += udata;       // Minutes
+
+      //data[2] = 0x40;   // 12-Hour Mode
+      data[2] = 0x00;     // 24-Hour Mode
+
+      udata = timeinfo.tm_hour/10;
+      data[2] += udata*0x10;  // 10 Hours
+      udata = timeinfo.tm_hour%10;
+      data[2] += udata;       // Hours
+
+      udata = timeinfo.tm_wday;
+      if(udata == 0) udata = 7;
+      data[3] = udata;        // Day (1~7), Monday first
+
+      udata = timeinfo.tm_mday/10;
+      data[4] = udata*0x10;   // 10 Date
+      udata = timeinfo.tm_mday%10;
+      data[4] += udata;       // Date
+
+      udata = (timeinfo.tm_mon+1)/10;
+      data[5] = udata*0x10;   // 10 Month
+      udata = (timeinfo.tm_mon+1)%10;
+      data[5] += udata;       // Month
+
+      udata = (timeinfo.tm_year%100)/10;
+      data[6] = udata*0x10;   // 10 Year
+      udata = timeinfo.tm_year%10;
+      data[6] += udata;       // Year
+      sw.beginTransmission(I2C_ADDR_RTC);
+      sw.write(uint8_t(0));
+      for (int i = 0; i < 8; ++i) {
+        sw.write(data[i]);
+      }
+      sw.endTransmission();
+    } else {
+      Serial.println("Failed to obtain time");
+    }
   } else {
     Serial.println("Invalid Test Number");
     return;
@@ -1635,12 +3149,13 @@ void sub_test_m(void) {
   char c;
   uint8_t reg;
   Serial.println("Sub-test M - IO Expander");
+  prt_cmd_info_m();
 
   Serial.print("Input Test Number: ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1651,7 +3166,7 @@ void sub_test_m(void) {
     Serial.print("data: "); Serial.println(data, HEX);
 
     for(int i=1; i<9; i++){
-      if(get_swtich_val(i) == SWITCH_ON){
+      if(get_switch_val(i) == SWITCH_ON){
         Serial.print("Switch"); Serial.print(i); Serial.println(": ON");
       } else {
         Serial.print("Switch"); Serial.print(i); Serial.println(": OFF");
@@ -1690,14 +3205,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1708,14 +3223,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1732,14 +3247,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1750,14 +3265,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       reg |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       reg |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1769,14 +3284,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       val[0] = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       val[0] = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1787,14 +3302,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       val[0] |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       val[0] |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1806,14 +3321,14 @@ void sub_test_m(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       val[1] = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       val[1] = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -1831,7 +3346,7 @@ void sub_test_m(void) {
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       val[1] |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       val[1] |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -1857,9 +3372,19 @@ void sub_test_m(void) {
   } else if(c == '6') {  // GPIO LOW
     digitalWrite(PIN_GPIO, LOW);
   } else if(c == '7') {  // PCM_Control HIGH
+    Serial.println("PCM Control to HIGH - AC Power-ON");
     digitalWrite(PIN_PCM_CONTROL, HIGH);
   } else if(c == '8') {  // PCM_Control LOW
+    Serial.println("PCM Control to LOW - AC Power-OFF");
     digitalWrite(PIN_PCM_CONTROL, LOW);
+  } else if(c == '9') {
+    Serial.print("System will be restart in 10 seconds");
+    for(int i=0; i<10; i++){
+      Serial.print(".");
+      delay(1000);
+    }
+    Serial.println();
+    ESP.restart();
   } else {
     Serial.println("Invalid Test Number");
     return;
@@ -1873,12 +3398,13 @@ void sub_test_n(void) {
   int numBytes;
   char c;
   Serial.println("Sub-test N - W5500");
+  prt_cmd_info_n();
 
   Serial.print("Input Test Number: ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -1916,7 +3442,7 @@ void sub_test_n(void) {
     digitalWrite(SS, HIGH);
     SPI.endTransaction();
 
-  } else if(c == '2') {  // 
+  } else if(c == '2') {  // VSPI Test
 
     pinMode(SS, OUTPUT);
     digitalWrite(SS, HIGH);
@@ -1932,26 +3458,27 @@ void sub_test_n(void) {
     vspi->endTransaction();
     delete vspi;
 
-  } else if(c == '3') {  // 
+  } else if(c == '3') {  // IP Set
     Ethernet.init(PIN_ETH_CS);
     pCUR_SPI = pspi;
     Ethernet.begin(nc_mac, nc_ip, nc_dns, nc_gateway, nc_subnet);
     pspi->setFrequency(40000000);
     Ethernet._pinRST = PIN_W5500_RST;
     Ethernet._pinCS = PIN_ETH_CS;
-    Ethernet.setHostname("PMS04_001");
+    Ethernet.setHostname("PMS0X_001");
     Ethernet.setRetransmissionCount(3);
     Ethernet.setRetransmissionTimeout(4000);
 
     Serial.print("getChip(): "); Serial.println(Ethernet.getChip(), DEC);
     Serial.print("localIP(): "); Serial.println(Ethernet.localIP());
 
-  } else if(c == '4') {
+  } else if(c == '4') {  // Check LINK Status
     Serial.print("linkStatus: "); Serial.println(Ethernet.linkStatus(), DEC); //LINK_ON, LINK_OFF
     Serial.print("PhyState: "); Serial.println(Ethernet.phyState(), HEX);
     Serial.print("HardwareStatus: "); Serial.println(Ethernet.hardwareStatus());
     Serial.print("speed: "); Serial.println(Ethernet.speed(), DEC);
     Serial.print("duplex: "); Serial.println(Ethernet.duplex(), DEC);
+    Serial.print("localIP(): "); Serial.println(Ethernet.localIP());
     Serial.print("dnsServerIP: "); Serial.println(Ethernet.dnsServerIP());
 
   } else if(c == '5') {
@@ -2019,13 +3546,20 @@ void sub_test_n(void) {
     //DhcpClass* dhcp = new DhcpClass();
     dhcp->beginWithDHCP(nc_mac);
     Serial.print("localIP(): "); Serial.println(dhcp->getLocalIp());
+    Ethernet.setLocalIP(dhcp->getLocalIp());
     //delete dhcp;
   } else if(c == '8') {
     Serial.print("DhcpServerIp(): "); Serial.println(dhcp->getDhcpServerIp());
     Serial.print("localIP(): "); Serial.println(dhcp->getLocalIp());
   } else if(c == '9') {
-    //Ethernet.WoL(1);
-    //Serial.print("WoL: "); Serial.println(Ethernet.WoL(), DEC);
+    if(gv_mqtt[0]){
+      mqtt_client.setServer(gv_mqtt, MQTT_PORT);
+    } else {
+      mqtt_client.setServer(MQTT_SERVER, MQTT_PORT);
+    }
+    mqtt_client.setCallback(mqtt_callback);
+
+    if(wifi_connected && mqtt_access) connectToMQTT();
   } else {
     Serial.println("Invalid Test Number");
     return;
@@ -2040,12 +3574,13 @@ void sub_test_o(void) {
   char c;
   uint8_t data = 0;
   Serial.println("Sub-test O - UART TX");
+  prt_cmd_info_o();
 
   Serial.print("Select Port (1:RS232, 2:RS485): ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -2062,33 +3597,13 @@ void sub_test_o(void) {
     Serial.println("Invalid port number");
     return;
   }
-/*
-  Serial.print("Select Data Type (h:hex, c:char): ");
-  while(1){
-    if(Serial.available()) {
-      c = Serial.read();
-      break;
-    }
-    delay(100);
-  }
-  Serial.println(c);
-  c = tolower(c);
 
-  if(c == 'h') {
-    dtype = 0;
-  } else if(c == 'c') {
-    dtype = 1;
-  } else {
-    Serial.println("Invalid data type");
-    return;
-  }
-*/
   while(1) {
     Serial.println("Input data: ");
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c) || (c == '#')) break;
       }
       delay(100);
     }
@@ -2116,12 +3631,13 @@ void sub_test_p(void) {
   uint8_t data[128] = {0,};
   uint16_t length, rsize;
   Serial.println("Sub-test P - UART RX");
+  prt_cmd_info_p();
 
   Serial.print("Select Port (1:RS232, 2:RS485): ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -2138,27 +3654,7 @@ void sub_test_p(void) {
     Serial.println("Invalid port number");
     return;
   }
-/*
-  Serial.print("Select Data Type (h:hex, c:char): ");
-  while(1){
-    if(Serial.available()) {
-      c = Serial.read();
-      break;
-    }
-    delay(100);
-  }
-  Serial.println(c);
-  c = tolower(c);
 
-  if(c == 'h') {
-    dtype = 0;
-  } else if(c == 'c') {
-    dtype = 1;
-  } else {
-    Serial.println("Invalid data type");
-    return;
-  }
-*/
   Serial.println("Received Data: ");
 
   while(1) {
@@ -2184,7 +3680,7 @@ void sub_test_p(void) {
 
     if(Serial.available()) {
       c = Serial.read();
-      if(c == 'q') {
+      if((c == 'q') || (c == '#')) {
         Serial.println("Exit Data Receive");
         break;
       }
@@ -2197,57 +3693,595 @@ void sub_test_p(void) {
 void sub_test_q(void) {
 #ifndef DISABLE_IR_FUNCTION
   char c;
-  /*
-   * Set up the data to be sent.
-   * For most protocols, the data is build up with a constant 8 (or 16 byte) address
-   * and a variable 8 bit command.
-   * There are exceptions like Sony and Denon, which have 5 bit address.
-  */
-  uint8_t sCommand = 0x34;
-  uint8_t sRepeats = 0;
 
   Serial.println("Sub-test Q - IR");
+  prt_cmd_info_q();
 
   Serial.print("Input Test Number: ");
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
   Serial.println(c);
 
-  if(c == '0') {  // Send IR
-    Serial.println();
-    Serial.print(F("Send now: address=0x00, command=0x"));
-    Serial.print(sCommand, HEX);
-    Serial.print(F(", repeats="));
-    Serial.print(sRepeats);
-    Serial.println();
-
-    Serial.println(F("Send standard NEC with 8 bit address"));
-    Serial.flush();
-
-    // Receiver output for the first loop must be: Protocol=NEC Address=0x102 Command=0x34 Raw-Data=0xCB340102 (32 bits)
-    IrSender.sendNEC(0x00, sCommand, sRepeats);
-#if 0
-    /*
-     * Increment send values
-     */
-    sCommand += 0x11;
-    sRepeats++;
-    // clip repeats at 4
-    if (sRepeats > 4) {
-        sRepeats = 4;
+  if(c == '0') {  // PIN_IR
+    uint8_t ir_pin = 0;
+    while(1) {
+      if(Serial.available()) {
+        c = Serial.read();
+        if(isalnum(c)){
+          Serial.println(c);
+        } else {
+          continue;
+        }
+      }
+      if(c == 'q'){
+        Serial.println("Quit loop");
+        break;
+      }
+      Serial.printf("PIN_IR: %d\r\n", ir_pin);
+      digitalWrite(PIN_IR, ir_pin);
+      if(ir_pin){
+        ir_pin = 0;
+      } else {
+        ir_pin = 1;
+      }
+      delay(1000);
     }
-#endif
-    delay(100);  // delay must be greater than 5 ms (RECORD_GAP_MICROS), otherwise the receiver sees it as one long signal
+  } else if(c == '1') {
+
+      Serial.println("Send NEC Raw 32bit Data");
+
+      // Address: 0x00, Command: 0x07
+      IrSender.sendNEC(0x00FFE01F);
+
+  } else if(c == '2') {
+
+      Serial.println("Send Raw Data");
+
+      // F609FF00
+      uint16_t irSignal1[] = {9000, 4450, 600, 550, 550, 550, 600, 550, 550, 550, 600, 500, 600, 550, 550, 600, 550, 550, 600, 1650, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1650, 600, 1650, 550, 1700, 550, 550, 600, 550, 550, 1700, 550, 550, 600, 500, 600, 550, 550, 600, 550, 550, 600, 1650, 550, 1700, 550, 550, 600, 1650, 550, 1700, 550, 1700, 550, 1700, 550}; // NEC FF906F
+      // E21DFF00
+      uint16_t irSignal2[] = {9000, 4500, 550, 550, 600, 550, 550, 550, 550, 600, 550, 550, 600, 550, 550, 550, 550, 550, 600, 1650, 600, 1700, 500, 1700, 600, 1700, 500, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 550, 550, 1700, 550, 1700, 550, 1700, 550, 550, 550, 550, 600, 550, 550, 550, 600, 1700, 500, 600, 550, 550, 600, 500, 600, 1650, 600, 1650, 600, 1650, 550}; // NEC FFB847
+      // F807FF00
+      uint16_t irSignal3[] = {9000, 4500, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550, 1700, 550}; // NEC FFB847
+
+      IrSender.sendRaw(irSignal1, 67, 38);
+      delay(100);
+      IrSender.sendRaw(irSignal2, 67, 38);
+      delay(100);
+      IrSender.sendRaw(irSignal3, 67, 38);
+
   } else {
     Serial.println("Invalid Test Number");
     return;
   }
 #endif
+}
+
+void sub_test_r(void) {
+
+  uint8_t data;
+  char c;
+  Serial.println("Sub-test R - EEPROM");
+  prt_cmd_info_r();
+
+  Serial.print("Input Test Number: ");
+  while(1){
+    if(Serial.available()) {
+      c = Serial.read();
+      if(isalnum(c)) break;
+    }
+    delay(100);
+  }
+  Serial.println(c);
+
+  if(c == '0') {
+    for(int i=0; i<EEPROM_SIZE; i++){
+      Serial.printf("Data[%d]: %02x\r\n", i, EEPROM.read(i));
+    }
+  } else if(c == '1') {
+    for(int i=0; i<EEPROM_SIZE; i++){
+      data = (uint8_t) (i % 256);
+      EEPROM.write(i, data);
+    }
+    EEPROM.commit();
+  } else {
+    Serial.println("Invalid Test Number");
+    return;
+  }
+
+}
+
+void sub_test_s(void) {
+
+  uint8_t data;
+  char c;
+  int r_data = 0;
+  String strLog;
+  Serial.println("Sub-test S - LiitleFS");
+  prt_cmd_info_s();
+
+  Serial.print("Input Test Number: ");
+  while(1){
+    if(Serial.available()) {
+      c = Serial.read();
+      if(isalnum(c)) break;
+    }
+    delay(100);
+  }
+  Serial.println(c);
+
+  if(c == '0') {
+    LittleFS.begin();
+    LittleFS.format();
+  } else if(c == '1') {  // create log file
+    writeFile(LittleFS, "/log_today.txt", (String((char*) str_cur_date)+ "\r\n").c_str());
+    readFile(LittleFS, "/log_today.txt");
+  } else if(c == '2') {  // add log message
+    r_data = random(0, 1000);
+    appendFile(LittleFS, "/log_today.txt", (String((char*) str_cur_time)+" - log data: "+String(r_data)+"\r\n").c_str());
+    readFile(LittleFS, "/log_today.txt");
+  } else if(c == '3') {
+    File file = LittleFS.open("/log_today.txt");
+    if(!file || file.isDirectory()){
+        Serial.println("- failed to open file for reading");
+        return;
+    }
+
+    Serial.println("- read from file:");
+    int i=0;
+    while(file.available()){
+        Serial.printf("[%d]:%s\r\n", i++, file.readStringUntil(0x0d));
+        file.read();
+    }
+    file.close();
+
+  } else if(c == '4') {
+    writeFile(LittleFS, "/init.txt", (String((char*) str_cur_date)+ "\r\n").c_str());
+    readFile(LittleFS, "/init.txt");
+  } else if(c == '5') {
+    Serial.println("Enter data:");
+    char cbuf[256] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          break;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+  } else if(c == '6') {
+    Serial.printf("TotalBytes: %d(0x%x), UsedBytes: %d(0x%x)\r\n", 
+      LittleFS.totalBytes(), LittleFS.totalBytes(), LittleFS.usedBytes(), LittleFS.usedBytes());
+  } else {
+    Serial.println("Invalid Test Number");
+    return;
+  }
+
+}
+
+void sub_test_t(void) {
+
+  uint8_t data;
+  char c;
+  int r_data = 0;
+  Serial.println("Sub-test T - Web Server");
+  prt_cmd_info_t();
+
+  Serial.print("Input Test Number: ");
+  while(1){
+    if(Serial.available()) {
+      c = Serial.read();
+      if(isalnum(c)) break;
+    }
+    delay(100);
+  }
+  Serial.println(c);
+
+  if(c == '0') {
+    // Connect to WiFi network
+    if((gv_ssid[0] == 0x00) || (gv_passwd[0] == 0x00)){
+      Serial.println("Invalid SSID or PASSWORD");
+      return;
+    }
+    WiFi.begin(gv_ssid, gv_passwd);
+    Serial.println("WiFi starting");
+    // Wait for connection
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("");
+    Serial.print("Connected to ");
+    Serial.println(gv_ssid);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+    wifi_connected = 1;
+
+  } else if(c == '1') {
+    // use mdns for host name resolution
+    if (!MDNS.begin(host))  // http://PMSMGR.local
+      Serial.println("Error setting up MDNS responder!");   
+    else
+      Serial.printf("mDNS responder started. Hotstname = http://%s.local\n", host);
+  } else if(c == '2') {
+    server.on("/", HTTP_GET, handleMain);
+  
+    // upload file to FS. Three callbacks
+    server.on("/update", HTTP_POST, []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+      ESP.restart();
+    }, []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("Update: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        // flashing firmware to ESP
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { //true to set the size to the current progress
+          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+        } else {
+          Update.printError(Serial);
+        }
+      }
+    });
+ 
+    server.on("/delete", HTTP_GET, handleFileDelete);
+    server.on("/main", HTTP_GET, handleMain); // JSON format used by /edit
+    // second callback handles file uploads at that location
+    server.on("/edit", HTTP_POST, []()
+      {server.send(200, "text/html", "<meta http-equiv='refresh' content='1;url=/main'>File uploaded. <a href=/main>Back to list</a>"); }, handleFileUpload); 
+       server.onNotFound([](){if(!handleFileRead(server.uri())) server.send(404, "text/plain", "404 FileNotFound");});
+ 
+    server.begin();
+  } else if(c == '3') {
+    Serial.println("Web-server is running!");
+    Serial.println("Press q to quit: ");
+    while(1){
+      if(Serial.available()) {
+        c = Serial.read();
+        if(isalnum(c)) Serial.println(c);
+      }
+      if(c == 'q') {
+        Serial.println("Quit loop");
+        break;
+      }
+      server.handleClient();
+      delay(2);
+    }
+  } else {
+    Serial.println("Invalid Test Number");
+    return;
+  }
+
+}
+
+void sub_test_v(void) {
+
+  uint8_t data;
+  char c;
+  char dummy_c;
+  uint8_t update_needed = 0;
+  uint8_t str_tmp[128] = {0,};
+  String str_in;
+ 
+  Serial.println("Sub-test V - Settings");
+  prt_cmd_info_v();
+
+  Serial.print("Input Test Number: ");
+  while(1){
+    if(Serial.available()) {
+      c = Serial.read();
+      if(isalnum(c)) break;
+    }
+    delay(100);
+  }
+  Serial.println(c);
+  if(Serial.available()){ // dummy read
+    dummy_c = Serial.read();
+  }
+
+  if(c == '0') {  // create init file
+    fsFound = initFS(true, true);
+    if(!fsFound) {
+      Serial.println("Filesystem is not found!");
+      return;
+    }
+    init_settings();
+    update_settings();
+
+    readFile(LittleFS, "/init.txt");
+  } else if(c == '1') {  // WLAN settings
+    Serial.print("[WLAN] Enter SSID: ");
+    char cbuf[128] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      memset(gv_ssid, 0x00, sizeof(gv_ssid));
+      strcpy(gv_ssid, cbuf);
+      update_needed = 1;
+    }
+    if(Serial.available()){ // dummy read
+      dummy_c = Serial.read();
+    }
+
+    Serial.print("[WLAN] Enter PASSWD: ");
+    memset(cbuf, 0x00, sizeof(cbuf));
+    idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      memset(gv_passwd, 0x00, sizeof(gv_passwd));
+      strcpy(gv_passwd, cbuf);
+      update_needed = 1;
+    }
+  } else if(c == '2') {  // LAN settings
+    Serial.print("[LAN] Select Static/DHCP: ");
+    char cbuf[128] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    for(int i=0; i < sizeof(cbuf); i++){
+      cbuf[i] = toLowerCase(cbuf[i]);
+    }
+    if(cbuf[0]){
+      str_in = cbuf;
+      if(!str_in.compareTo("static")){
+        nc_ip_type = IP_TYPE_STATIC;
+        update_needed = 1;
+      } else if(!str_in.compareTo("dhcp")){
+        nc_ip_type = IP_TYPE_DHCP;
+        update_needed = 1;
+      }
+    }
+
+    if(Serial.available()){ // dummy read
+      dummy_c = Serial.read();
+    }
+
+    Serial.print("[LAN] Enter IP: ");
+    memset(cbuf, 0x00, sizeof(cbuf));
+    idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      str_in = cbuf;
+      nc_ip.fromString(str_in);
+      update_needed = 1;
+    }
+
+    if(Serial.available()){ // dummy read
+      dummy_c = Serial.read();
+    }
+
+    Serial.print("[LAN] Enter Subnet: ");
+    memset(cbuf, 0x00, sizeof(cbuf));
+    idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      str_in = cbuf;
+      nc_subnet.fromString(str_in);
+      update_needed = 1;
+    }
+
+    if(Serial.available()){ // dummy read
+      dummy_c = Serial.read();
+    }
+
+    Serial.print("[LAN] Enter Gateway: ");
+    memset(cbuf, 0x00, sizeof(cbuf));
+    idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      str_in = cbuf;
+      nc_gateway.fromString(str_in);
+      update_needed = 1;
+    }
+
+    if(Serial.available()){ // dummy read
+      dummy_c = Serial.read();
+    }
+
+    Serial.print("[LAN] Enter DNS: ");
+    memset(cbuf, 0x00, sizeof(cbuf));
+    idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      str_in = cbuf;
+      nc_dns.fromString(str_in);
+      update_needed = 1;
+    }
+  } else if(c == '3') {  // Server settings
+    Serial.print("[Server] Enter IP: ");
+    char cbuf[128] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      str_in = cbuf;
+      nc_server.fromString(str_in);
+      update_needed = 1;
+    }
+  } else if(c == '4') {  // System settings
+    Serial.print("[System] Enter SN: ");
+    char cbuf[128] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(isalnum(cbuf[0])){
+      update_serial_number(cbuf);
+      update_needed = 1;
+    }
+  } else if(c == '5') {  // MQTT settings
+    Serial.print("[MQTT] Enter MQTT Server: ");
+    char cbuf[128] = {0,};
+    int idx = 0;
+    while(1){
+      if(Serial.available()) {
+        cbuf[idx] = Serial.read();
+        Serial.print(cbuf[idx]);
+        if(cbuf[idx]=='\n') {
+          cbuf[idx] = 0;
+          Serial.println();
+          break;
+        } else if(cbuf[idx]=='\r'){
+          cbuf[idx] = 0;
+        }
+        idx++;
+      }
+    }
+    Serial.printf("Input Data String: %s\r\n", cbuf);
+    if(cbuf[0]){
+      memset(gv_mqtt, 0x00, sizeof(gv_mqtt));
+      strcpy(gv_mqtt, cbuf);
+      update_needed = 1;
+    }
+  } else {
+    Serial.println("Invalid Test Number");
+    return;
+  }
+  if(update_needed){
+    update_settings();
+    readFile(LittleFS, "/init.txt");
+  }
 }
 
 void sub_test_y(void) {
@@ -2260,7 +4294,7 @@ void sub_test_y(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -2276,7 +4310,7 @@ void sub_test_y(void) {
   while(1){
     if(Serial.available()) {
       c = Serial.read();
-      break;
+      if(isalnum(c)) break;
     }
     delay(100);
   }
@@ -2295,14 +4329,14 @@ void sub_test_y(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       buf[i] = (c - '0')*0x10;
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       buf[i] = (c - 'a' + 0xa)*0x10;
     } else {
       Serial.println("Invalid input");
@@ -2313,14 +4347,14 @@ void sub_test_y(void) {
     while(1){
       if(Serial.available()) {
         c = Serial.read();
-        break;
+        if(isalnum(c)) break;
       }
       delay(100);
     }
     c = tolower(c);
     if((c >= '0') && (c <= '9')) {
       buf[i] |= (c - '0');
-    } else if ((c >= 'a') && (c <= 'z')) {
+    } else if ((c >= 'a') && (c <= 'f')) {
       buf[i] |= (c - 'a' + 0xa);
     } else {
       Serial.println("Invalid input");
@@ -2344,25 +4378,36 @@ void sub_test_z(void) {
   uint8_t addr;
   PZEM004Tv30* ppzem[4];
 
+#if (SYS_PMS_HW == SYS_PMS04)
+  ppzem[0] = &pzem3;
+  ppzem[1] = &pzem2;
+  ppzem[2] = &pzem1;
+  ppzem[3] = &pzem0;
+#elif (SYS_PMS_HW == SYS_PMS01)
   ppzem[0] = &pzem0;
-  ppzem[1] = &pzem1;
-  ppzem[2] = &pzem2;
-  ppzem[3] = &pzem3;
+#endif
+
+  Serial.println("Sub-test Z - PZEM Measurement Test");
 
   Serial.println("Press q to quit: ");
 
   while(1) {
     if(Serial.available()) {
       c = Serial.read();
-      Serial.println(c);
+      if(isalnum(c)){
+        Serial.println(c);
+      } else {
+        continue;
+      }
     }
     if(c == 'q'){
       Serial.println("Quit loop");
       break;
     }
 
+    // PZEM Address Check
     addr = ppzem[idx]->readAddress();
-    Serial.print("Custom Address["); Serial.print(idx); Serial.print("]: ");
+    Serial.print("Custom Address[PM-"); Serial.print(idx+1); Serial.print("]: ");
     Serial.println(addr, HEX);
 
     if(addr) {
@@ -2409,7 +4454,9 @@ void sub_test_z(void) {
 
     Serial.println();
 
-    if(++idx > 3) idx = 0;
+#if (SYS_PMS_HW == SYS_PMS04)
+   if(++idx > 3) idx = 0;
+#endif
     delay(1000);
   }
 
